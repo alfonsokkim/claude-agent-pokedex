@@ -451,25 +451,14 @@ final class PetView: NSView {
         2 + ("Ag" as NSString).size(withAttributes: [.font: captionFont]).height + 4
     }
     // Layout, top-down (the view is flipped): room for jumps and drifting z's,
-    // the sprite, then room for the dots or caption under it. The hover label
-    // sits beside its feet, so pets can stack tightly.
+    // the sprite, then room for the dots or the caption (its status, or "is
+    // done") under it. The sprite is centred across the window.
     static let spriteTop: CGFloat = 40
     let pace: CGFloat = 12
 
-    /// Whether the pets line up against the left edge of the screen, which
-    /// moves the sprite to the left of its window and its label to its right.
-    var onLeft = false {
-        didSet {
-            guard onLeft != oldValue else { return }
-            updateTrackingAreas()
-            needsDisplay = true
-        }
-    }
-
-    /// Where the sprite rests: against the screen-edge side of the window,
-    /// leaving just enough room to pace.
-    func homeX(onLeft: Bool) -> CGFloat { onLeft ? pace + 4 : bounds.width - spriteSize - pace - 4 }
-    var homeX: CGFloat { homeX(onLeft: onLeft) }
+    /// Where the sprite rests: the middle of the window, so the caption under
+    /// it can centre. At a screen edge the window hangs past it (see PetPanel).
+    var homeX: CGFloat { (bounds.width - spriteSize) / 2 }
 
     private(set) var agent: Agent
     private(set) var pokemon: String
@@ -712,11 +701,16 @@ final class PetView: NSView {
 
         switch mood {
         case .working: drawWorkingDots(under: rect)
-        case .done: drawCaption("\(name) is done", under: rect)
         case .sleeping, .stored: drawSnores(over: rect)
         default: break
         }
-        if hovering || Date() < labelUntil { drawLabel(summary) }
+        // One caption under the pet: its status while hovered (or just after it
+        // needs you), otherwise "is done" when it has finished.
+        if hovering || Date() < labelUntil {
+            drawCaption(summary)
+        } else if mood == .done {
+            drawCaption("\(name) is done")
+        }
     }
 
     /// Where the ground is: the bottom of the resting sprite frame.
@@ -733,19 +727,34 @@ final class PetView: NSView {
         }
     }
 
-    /// A short centred caption under the pet, such as "Pikachu is done".
-    func drawCaption(_ text: String, under rect: NSRect) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: Self.captionFont,
-            .foregroundColor: NSColor.white,
-        ]
-        let size = (text as NSString).size(withAttributes: attrs)
+    /// The part of this view that's on screen (all of it when rendering offscreen).
+    var onScreenRect: NSRect {
+        guard let window, let screen = window.screen ?? NSScreen.main else { return bounds }
+        let shown = window.frame.intersection(screen.visibleFrame)
+        guard !shown.isEmpty else { return bounds }
+        let inWindow = NSRect(origin: NSPoint(x: shown.minX - window.frame.minX, y: shown.minY - window.frame.minY),
+                              size: shown.size)
+        return convert(inWindow, from: nil)
+    }
+
+    /// A caption centred under the pet, such as "Pikachu is done" or its status,
+    /// slid inward only as far as it takes to stay on screen.
+    func drawCaption(_ text: String) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: Self.captionFont, .foregroundColor: NSColor.white]
+        let room = onScreenRect.intersection(bounds).insetBy(dx: 4, dy: 0)
+        var shown = text
+        var keep = text.count
+        while (shown as NSString).size(withAttributes: attrs).width + 12 > room.width && keep > 1 {
+            keep -= 1
+            shown = String(text.prefix(keep)) + "…"
+        }
+        let size = (shown as NSString).size(withAttributes: attrs)
         let width = size.width + 12
-        let x = min(max(homeX + spriteSize / 2 - width / 2, 2), bounds.width - width - 2)
-        let pill = NSRect(x: x, y: ground + 2, width: width, height: size.height + 4)
+        let x = min(max(homeX + spriteSize / 2 - width / 2, room.minX), room.maxX - width)
+        let pill = NSRect(x: x.rounded(), y: ground + 2, width: width, height: size.height + 4)
         NSColor(white: 0.1, alpha: 0.85).setFill()
         NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
-        (text as NSString).draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 2), withAttributes: attrs)
+        (shown as NSString).draw(at: NSPoint(x: pill.minX + 6, y: pill.minY + 2), withAttributes: attrs)
     }
 
     /// Three pixel z's drifting up and to the right off the top of the pet's
@@ -787,7 +796,7 @@ final class PetView: NSView {
     func drawStored(_ ball: CGImage) {
         let rect = ballRect(ball)
         drawSprite(ball, in: rect, mirrored: false)
-        if hovering { drawLabel(summary) }
+        if hovering { drawCaption(summary) }
     }
 
     /// Recall shrinks the pet into the ball in a red glow; release pops it
@@ -863,29 +872,6 @@ final class PetView: NSView {
                    y: ground - CGFloat(3 - row) * s,
                    width: CGFloat(rowPixels) * s, height: s).fill()
         }
-    }
-
-    func drawLabel(_ text: String) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: NSColor.white,
-        ]
-        let maxWidth = onLeft ? bounds.width - homeX - spriteSize - 24 : homeX - 24
-        var shown = text
-        var keep = text.count
-        while (shown as NSString).size(withAttributes: attrs).width > maxWidth && keep > 1 {
-            keep -= 1
-            shown = String(text.prefix(keep)) + "…"
-        }
-        let size = (shown as NSString).size(withAttributes: attrs)
-        // Beside the pet's feet, on the side away from the screen edge.
-        let width = size.width + 16
-        let pill = NSRect(x: onLeft ? homeX + spriteSize : homeX - width,
-                          y: Self.spriteTop + spriteSize - size.height - 14,
-                          width: width, height: size.height + 6)
-        NSColor(white: 0.1, alpha: 0.85).setFill()
-        NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
-        (shown as NSString).draw(at: NSPoint(x: pill.minX + 8, y: pill.minY + 3), withAttributes: attrs)
     }
 
     // MARK: Mouse
@@ -1190,7 +1176,7 @@ func stackOrigins(_ pets: [PetView], in visible: NSRect, arrangement: Arrangemen
     let onLeft = arrangement.onLeft
     let heights = pets.map(\.visibleHeight)
     // The window's x that puts the pet's sprite with its left edge at `left`.
-    func panelX(_ pet: PetView, spriteLeft left: CGFloat) -> CGFloat { left - pet.homeX(onLeft: onLeft) }
+    func panelX(_ pet: PetView, spriteLeft left: CGFloat) -> CGFloat { left - pet.homeX }
 
     guard arrangement.vertical else {
         // Centre to centre, neighbours sit the gap apart at their widest, so a
@@ -1246,9 +1232,9 @@ final class PetPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    /// Lets a window sit partly behind the menu bar. A pet at the top of the
-    /// screen has empty jump room above it, and macOS would otherwise push the
-    /// whole window down onto the pet below.
+    /// Lets a window hang past the screen edges and behind the menu bar. Pets
+    /// sit in the middle of mostly empty windows (room for jumps and captions),
+    /// and macOS would otherwise push a window at the edge onto its neighbour.
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
@@ -1393,7 +1379,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var stack: [(pet: PetView, panel: PetPanel)] = []
         for pane in order {
             guard let pet = pets[pane], let panel = panels[pane] else { continue }
-            pet.onLeft = arrangement.onLeft
             if let point = saved[pet.pokemon].map(NSPointFromString),
                NSScreen.screens.contains(where: { $0.visibleFrame.contains(point) }) {
                 move(panel, to: point)
@@ -1578,7 +1563,6 @@ func renderDesktop(background path: String, to out: String, arrangement: Arrange
         pet.mood = c.mood
         pet.tick = c.tick
         pet.walkX = c.walkX
-        pet.onLeft = arrangement.onLeft
         return pet
     }
     let origins = stackOrigins(pets, in: NSRect(origin: .zero, size: size), arrangement: arrangement)
