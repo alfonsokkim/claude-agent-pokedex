@@ -487,7 +487,13 @@ final class PetView: NSView {
     var tick = Int.random(in: 0..<64) // so pets don't move in lockstep
     var walkX: CGFloat = 0
     var walkDirection: CGFloat = 1
-    var hovering = false
+    var hovering = false {
+        didSet {
+            guard hovering != oldValue else { return }
+            // Lift the hovered pet above its neighbours so its label shows on top.
+            window?.level = hovering ? NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1) : .floating
+        }
+    }
     var hopUntil = Date.distantPast
     var labelUntil = Date.distantPast
     var lastBusy: Date
@@ -525,6 +531,7 @@ final class PetView: NSView {
     func setPokemon(_ name: String, sheet: SpriteSheet) {
         pokemon = name
         self.sheet = sheet
+        updateTrackingAreas()
         needsDisplay = true
     }
 
@@ -572,7 +579,10 @@ final class PetView: NSView {
         }
         let resized = (next == .stored) != (mood == .stored)
         mood = next
-        if resized { onResize?() }
+        if resized {
+            updateTrackingAreas() // the ball is much smaller than the pet
+            onResize?()
+        }
     }
 
     /// How far the pet reaches above the ground in points, from its topmost pixel.
@@ -884,13 +894,24 @@ final class PetView: NSView {
     var windowStart: NSPoint?
     var dragged = false
 
+    /// Just the part of the window the pet covers: its sprite's real width (or
+    /// only the ball) from its top pixel down to its feet. Neighbours packed
+    /// close together never share any of it.
+    var hoverRect: NSRect {
+        let half = CGFloat(mood == .stored && pokeball != nil ? pokeballExtent.halfWidth : sheet.halfWidth) * Self.scale
+        let top = ground - visibleHeight
+        return NSRect(x: homeX + spriteSize / 2 - half, y: top, width: 2 * half, height: visibleHeight)
+    }
+
     override func updateTrackingAreas() {
+        super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
-        // The lower three quarters of the frame, where the Pokémon is, so stacked pets don't overlap.
-        let area = NSRect(x: homeX, y: Self.spriteTop + spriteSize / 4,
-                          width: spriteSize, height: spriteSize * 3 / 4)
-        addTrackingArea(NSTrackingArea(rect: area, options: [.mouseEnteredAndExited, .activeAlways],
+        addTrackingArea(NSTrackingArea(rect: hoverRect, options: [.mouseEnteredAndExited, .activeAlways],
                                        owner: self))
+        // The area may have shrunk out from under the mouse, which sends no exit.
+        if let window {
+            hovering = hoverRect.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        }
     }
 
     override func mouseEntered(with event: NSEvent) { hovering = true }
