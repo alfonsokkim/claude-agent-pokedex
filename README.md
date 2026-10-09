@@ -33,6 +33,14 @@ cd claude-agent-pokedex
 ./install.sh
 ```
 
+Or without git: [download the ZIP](https://github.com/alfonsokkim/claude-agent-pokedex/archive/refs/heads/main.zip),
+open it, then in Terminal:
+
+```bash
+cd ~/Downloads/claude-agent-pokedex-main
+zsh install.sh
+```
+
 The installer:
 
 1. downloads the sprites (they aren't shipped in this repo, see [Sprites](#sprites))

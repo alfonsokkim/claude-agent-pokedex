@@ -35,8 +35,8 @@ if ! command -v swiftc >/dev/null; then
   exit 1
 fi
 
-"$here/fetch-sprites.sh"
-"$here/build.sh"
+zsh "$here/fetch-sprites.sh"
+zsh "$here/build.sh"
 
 mkdir -p ~/.local/bin ~/.claude/commands
 install -m 755 "$here/claude-pet" ~/.local/bin/claude-pet
