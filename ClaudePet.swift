@@ -1746,8 +1746,54 @@ enum Context {
         let record = agent.pane.hasPrefix(HookSessions.prefix)
             ? records.first { HookSessions.prefix + $0.session == agent.pane }
             : records.filter { $0.herdrPane == agent.pane }.max { $0.updated < $1.updated }
-        guard let record, let path = record.transcript, let tokens = tokens(in: path) else { return nil }
-        return Double(tokens) / Double(window(model: record.model, tokens: tokens))
+        // A herdr pane that hasn't run a hook since the pets were installed is
+        // found through its process instead.
+        let path = record?.transcript ?? (agent.pane.hasPrefix(HookSessions.prefix) ? nil : paneTranscript(agent.pane))
+        guard let path, let tokens = tokens(in: path) else { return nil }
+        return Double(tokens) / Double(window(model: record?.model, tokens: tokens))
+    }
+
+    /// Panes' transcripts found by process, re-checked every half minute.
+    private static var paneTranscripts: [String: (checked: Date, path: String?)] = [:]
+
+    /// The transcript of the Claude Code session in a herdr pane. herdr names
+    /// the pane's foreground process, and Claude Code keeps a file per process
+    /// in ~/.claude/sessions naming its session, or the background job it was
+    /// parked in.
+    static func paneTranscript(_ pane: String) -> String? {
+        if let cached = paneTranscripts[pane], Date().timeIntervalSince(cached.checked) < 30 { return cached.path }
+        var path: String?
+        if let data = Herdr.run(["pane", "process-info", "--pane", pane]),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let info = (json["result"] as? [String: Any])?["process_info"] as? [String: Any],
+           let processes = info["foreground_processes"] as? [[String: Any]] {
+            path = processes.lazy.compactMap { ($0["pid"] as? Int).flatMap(session(ofPid:)) }.compactMap(transcript(of:)).first
+        }
+        paneTranscripts[pane] = (Date(), path)
+        return path
+    }
+
+    static let sessionsDirectory = NSHomeDirectory() + "/.claude/sessions"
+
+    static func sessionFile(_ name: String) -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: sessionsDirectory + "/" + name) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    /// The session a Claude Code process is showing.
+    static func session(ofPid pid: Int) -> String? {
+        guard let file = sessionFile("\(pid).json") else { return nil }
+        guard let job = file["parkedJobId"] as? String else { return file["sessionId"] as? String }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: sessionsDirectory)) ?? []
+        return names.lazy.filter { $0.hasSuffix(".json") }.compactMap(sessionFile).first {
+            $0["jobId"] as? String == job && ($0["pid"] as? Int).map { isAlive(pid_t($0)) } == true
+        }?["sessionId"] as? String
+    }
+
+    static func transcript(of session: String) -> String? {
+        let projects = NSHomeDirectory() + "/.claude/projects"
+        let folders = (try? FileManager.default.contentsOfDirectory(atPath: projects)) ?? []
+        return folders.lazy.map { "\(projects)/\($0)/\(session).jsonl" }.first { FileManager.default.fileExists(atPath: $0) }
     }
 
     static func tokens(in path: String) -> Int? {
