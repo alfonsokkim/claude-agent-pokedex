@@ -454,7 +454,11 @@ final class PetView: NSView {
     // the sprite, then room for the dots or the caption (its status, or "is
     // done") under it. The sprite is centred across the window.
     static let spriteTop: CGFloat = 40
-    let pace: CGFloat = 12
+    /// How far it paces either side while working. Less in a row, where
+    /// neighbours stand close enough that they'd walk into each other.
+    var pace = PetView.columnPace
+    static let columnPace: CGFloat = 12
+    static let rowPace: CGFloat = 4
 
     /// Where the sprite rests: the middle of the window, so the caption under
     /// it can centre. At a screen edge the window hangs past it (see PetPanel).
@@ -583,14 +587,12 @@ final class PetView: NSView {
     }
 
     /// How much room the pet needs across, for lining up in a row: its sprite at
-    /// its widest plus pacing room, or its "is done" caption if that's wider.
-    /// A Poké Ball needs only the ball; it never shows a caption.
+    /// its widest plus its pacing room, or just the ball when it's in one.
     var footprintWidth: CGFloat {
         if mood == .stored, pokeball != nil {
             return CGFloat(2 * pokeballExtent.halfWidth) * Self.scale
         }
-        let caption = ("\(name) is done" as NSString).size(withAttributes: [.font: Self.captionFont]).width + 12
-        return max(CGFloat(2 * sheet.halfWidth) * Self.scale + 2 * pace, caption)
+        return CGFloat(2 * sheet.halfWidth) * Self.scale + 2 * pace
     }
 
     /// Recalls the pet into its Poké Ball until you click it or its agent gets busy.
@@ -1179,9 +1181,9 @@ func stackOrigins(_ pets: [PetView], in visible: NSRect, arrangement: Arrangemen
     func panelX(_ pet: PetView, spriteLeft left: CGFloat) -> CGFloat { left - pet.homeX }
 
     guard arrangement.vertical else {
-        // Centre to centre, neighbours sit the gap apart at their widest, so a
-        // Poké Ball takes far less room than a Pokémon with its caption. Squeezed
-        // evenly if the row won't fit.
+        // Centre to centre, neighbours sit the gap apart at their widest (a Poké
+        // Ball takes far less room than a Pokémon). Squeezed evenly if the row
+        // won't fit.
         let widths = pets.map(\.footprintWidth)
         var steps = (0..<pets.count - 1).map { widths[$0] / 2 + stackGap + widths[$0 + 1] / 2 }
         let available = visible.width - 2 * stackMargin - pets[0].spriteSize
@@ -1386,6 +1388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 stack.append((pet, panel))
             }
         }
+        for (pet, _) in stack { pet.pace = arrangement.vertical ? PetView.columnPace : PetView.rowPace }
         // Last first, each ordered in front of the next, so in a column a pet's
         // caption covers the z's rising from the one below, and they pass behind it.
         let origins = stackOrigins(stack.map(\.pet), in: visible, arrangement: arrangement)
