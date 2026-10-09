@@ -618,7 +618,7 @@ final class PetView: NSView {
         case .done: return "\(name): \(agent.project) is done"
         case .working: return "\(name): \(agent.project) is working"
         case .sleeping: return "\(name) is asleep"
-        case .stored: return "\(name) is resting in its Poké Ball"
+        case .stored: return "\(name) is resting"
         case .idle: return "\(name): \(agent.project)"
         }
     }
