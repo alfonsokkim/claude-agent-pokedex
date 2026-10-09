@@ -62,6 +62,9 @@ you log in, add **Claude Pet** under System Settings → General → Login Items
 
 ## Install on Windows
 
+Heads up: I lowkey haven't tested the Windows version yet, so if it's cooked,
+just let me know by [opening an issue](https://github.com/alfonsokkim/claude-agent-pokedex/issues) :)
+
 1. Unzip the download.
 2. Double-click **install.cmd**.
 3. Windows may warn that it "protected your PC", because the app isn't signed.
