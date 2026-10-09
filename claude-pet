@@ -1,0 +1,9 @@
+#!/bin/zsh
+# Summons or dismisses the pets (Claude Pet.app), like /pet in Claude Code.
+if pgrep -xq ClaudePet; then
+  pkill -x ClaudePet
+  echo "Claude Pet dismissed"
+else
+  open "$HOME/Applications/Claude Pet.app"
+  echo "Claude Pet summoned"
+fi
