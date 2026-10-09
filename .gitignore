@@ -1,3 +1,5 @@
 sprites/
 sessions/
 .DS_Store
+windows/bin/
+windows/obj/

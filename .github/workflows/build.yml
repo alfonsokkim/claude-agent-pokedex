@@ -1,0 +1,71 @@
+# Builds both apps on every push. A version tag (v1.2.3) also publishes them
+# as a release with one download per platform:
+#   claude-agent-pokedex-mac.zip      the Mac source and installer (it builds on install)
+#   claude-agent-pokedex-windows.zip  the Windows app, ready to install
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build
+        run: >
+          dotnet publish windows/ClaudePet.csproj -c Release -r win-x64 --self-contained
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true -p:PublishReadyToRun=true -o publish
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "claude-agent-pokedex-windows"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item publish/ClaudePet.exe, windows/install.cmd, windows/uninstall.cmd, README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: claude-agent-pokedex-windows.zip
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build check
+        run: swiftc -parse-as-library -swift-version 5 ClaudePet.swift -o "$RUNNER_TEMP/ClaudePet"
+      - name: Package
+        run: |
+          dir=claude-agent-pokedex-mac
+          mkdir "$dir"
+          cp ClaudePet.swift Info.plist build.sh fetch-sprites.sh install.sh hooks.js claude-pet pet.md README.md "$dir/"
+          zip -qr "$dir.zip" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: claude-agent-pokedex-mac.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" windows/*.zip mac/*.zip
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME"
+          --notes "Download the zip for your computer. The README has the setup steps for each."
