@@ -148,6 +148,25 @@ let iconColors: [Character: NSColor] = [
 /// The hit flash on a pet that needs you.
 let hitRed = NSColor(srgbRed: 1, green: 0.12, blue: 0.12, alpha: 1)
 
+/// The CTX bar: a Gen 3 HP bar that shows how much of an agent's context is left.
+enum ContextBar {
+    static let outline = NSColor(srgbRed: 0.16, green: 0.17, blue: 0.20, alpha: 1)
+    static let body = NSColor(srgbRed: 0.28, green: 0.28, blue: 0.31, alpha: 1)
+    static let label = NSColor(srgbRed: 0.97, green: 0.69, blue: 0.19, alpha: 1)
+    static let border = NSColor(srgbRed: 0.97, green: 0.97, blue: 0.97, alpha: 1)
+    static let empty = NSColor(srgbRed: 0.22, green: 0.22, blue: 0.25, alpha: 1)
+    /// (light, shade) for more than half left, more than a fifth, and the rest.
+    static let green = (NSColor(srgbRed: 0.44, green: 0.97, blue: 0.66, alpha: 1), NSColor(srgbRed: 0.28, green: 0.78, blue: 0.47, alpha: 1))
+    static let yellow = (NSColor(srgbRed: 0.97, green: 0.88, blue: 0.22, alpha: 1), NSColor(srgbRed: 0.78, green: 0.66, blue: 0.03, alpha: 1))
+    static let red = (NSColor(srgbRed: 0.97, green: 0.35, blue: 0.22, alpha: 1), NSColor(srgbRed: 0.69, green: 0.22, blue: 0.19, alpha: 1))
+    /// "C", "T", "X" in a 3x5 pixel font.
+    static let glyphs = [
+        [".##", "#..", "#..", "#..", ".##"],
+        ["###", ".#.", ".#.", ".#.", ".#."],
+        ["#.#", "#.#", ".#.", "#.#", "#.#"],
+    ]
+}
+
 // MARK: - Agents (from herdr)
 
 /// One coding agent: a herdr pane, or a Claude Code session reported by the
@@ -160,6 +179,8 @@ struct Agent {
     /// For hook sessions: the terminal app to bring forward, and Claude's process.
     var app: String? = nil
     var pid: pid_t? = nil
+    /// How full its context window is, 0 to 1, when known.
+    var contextUsed: Double? = nil
 
     var label: String { title.isEmpty ? project : "\(project): \(title)" }
 }
@@ -293,6 +314,7 @@ enum HookSessions {
         var app: String?        // the terminal's bundle id, outside herdr
         var herdrPane: String?  // set when the session runs inside herdr
         var transcript: String?
+        var model: String?      // from SessionStart, when Claude Code includes it
     }
 
     static func url(_ session: String) -> URL { URL(fileURLWithPath: "\(directory)/\(session).json") }
@@ -337,6 +359,7 @@ enum HookSessions {
         record.updated = started
         record.cwd = event["cwd"] as? String ?? record.cwd
         record.transcript = event["transcript_path"] as? String ?? record.transcript
+        record.model = event["model"] as? String ?? record.model
         record.pid = claudePID()
         record.herdrPane = env["HERDR_PANE_ID"]
         record.app = record.herdrPane == nil ? env["__CFBundleIdentifier"] : nil
@@ -353,9 +376,9 @@ enum HookSessions {
         return pid
     }
 
-    /// Live sessions, oldest first. Drops ones whose Claude has exited, and
-    /// ones inside herdr while herdr is reporting them itself.
-    static func agents(herdrRunning: Bool) -> [Agent] {
+    /// Every live session, including ones inside herdr. Drops (and deletes)
+    /// ones whose Claude has exited.
+    static func liveRecords() -> [Record] {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return [] }
         let now = Date().timeIntervalSince1970
         var records: [Record] = []
@@ -367,14 +390,19 @@ enum HookSessions {
                 try? FileManager.default.removeItem(at: url)
                 continue
             }
-            if record.herdrPane != nil && herdrRunning { continue }
             if (record.status == "working" || record.status == "blocked") && wasInterrupted(record) {
                 record.status = "idle"
                 write(record)
             }
             records.append(record)
         }
-        return records.sorted { $0.started < $1.started }.map {
+        return records
+    }
+
+    /// The sessions to show as their own pets, oldest first: all of them, less
+    /// the ones inside herdr while herdr is reporting them itself.
+    static func agents(from records: [Record], herdrRunning: Bool) -> [Agent] {
+        records.filter { !($0.herdrPane != nil && herdrRunning) }.sorted { $0.started < $1.started }.map {
             Agent(pane: prefix + $0.session, status: $0.status, title: "",
                   project: ($0.cwd as NSString).lastPathComponent, app: $0.app, pid: $0.pid)
         }
@@ -492,6 +520,7 @@ final class PetView: NSView {
     var lastBusy: Date
     var previousStatus: String?
     var finishedAt: Date?
+    var contextUsed: Double?
     var transition: Transition?
 
     init(agent: Agent, pokemon: String, sheet: SpriteSheet) {
@@ -537,6 +566,7 @@ final class PetView: NSView {
         }
         previousStatus = latest.status
         agent = latest
+        contextUsed = latest.contextUsed
 
         let next: Mood
         switch latest.status {
@@ -706,6 +736,7 @@ final class PetView: NSView {
         case .sleeping, .stored: drawSnores(over: rect)
         default: break
         }
+        drawContextBarIfShown(headTop: Self.spriteTop + CGFloat(sheet.top) * Self.scale)
         // One caption under the pet: its status while hovered (or just after it
         // needs you), otherwise "is done" when it has finished.
         if hovering || Date() < labelUntil {
@@ -798,7 +829,50 @@ final class PetView: NSView {
     func drawStored(_ ball: CGImage) {
         let rect = ballRect(ball)
         drawSprite(ball, in: rect, mirrored: false)
+        drawContextBarIfShown(headTop: ground - CGFloat(ball.height - pokeballTop) * Self.scale)
         if hovering { drawCaption(summary) }
+    }
+
+    /// The CTX bar above the pet's head, while you hover over it or once its
+    /// context is at least 80% used.
+    func drawContextBarIfShown(headTop: CGFloat) {
+        guard let used = contextUsed, hovering || used >= 0.8 else { return }
+        drawContextBar(used: used, headTop: headTop)
+    }
+
+    /// A Gen 3 HP bar labelled CTX: it drains as the chat fills its context
+    /// window, from green to yellow below half to red below a fifth.
+    func drawContextBar(used: Double, headTop: CGFloat) {
+        let px: CGFloat = 2, width = 42, height = 7, track = 24
+        let left = (homeX + spriteSize / 2 - CGFloat(width) * px / 2).rounded()
+        let top = (headTop - 3 - CGFloat(height) * px).rounded()
+        func fill(_ color: NSColor, _ x: Int, _ y: Int, _ w: Int = 1, _ h: Int = 1) {
+            color.setFill()
+            NSRect(x: left + CGFloat(x) * px, y: top + CGFloat(y) * px, width: CGFloat(w) * px, height: CGFloat(h) * px).fill()
+        }
+
+        // A dark capsule with rounded ends around a grey body.
+        fill(ContextBar.outline, 1, 0, width - 2)
+        fill(ContextBar.outline, 1, height - 1, width - 2)
+        fill(ContextBar.outline, 0, 1, 1, height - 2)
+        fill(ContextBar.outline, width - 1, 1, 1, height - 2)
+        fill(ContextBar.body, 1, 1, width - 2, height - 2)
+        // "CTX" where the HP label would be.
+        for (i, glyph) in ContextBar.glyphs.enumerated() {
+            for (row, line) in glyph.enumerated() {
+                for (col, key) in line.enumerated() where key == "#" { fill(ContextBar.label, 2 + i * 4 + col, 1 + row) }
+            }
+        }
+        // The white-edged track, filled with what's left.
+        fill(ContextBar.border, 14, 1, track + 2, 5)
+        fill(ContextBar.empty, 15, 2, track, 3)
+        let remaining = max(0, min(1, 1 - used))
+        let filled = remaining > 0 ? max(1, Int((Double(track) * remaining).rounded())) : 0
+        let (light, shade) = remaining > 0.5 ? ContextBar.green : remaining > 0.2 ? ContextBar.yellow : ContextBar.red
+        if filled > 0 {
+            fill(light, 15, 2, filled, 2)
+            fill(shade, 15, 4, filled)
+        }
     }
 
     /// Recall shrinks the pet into the ball in a red glow; release pops it
@@ -1597,11 +1671,14 @@ func renderDesktop(background path: String, to out: String, arrangement: Arrange
 func renderSheet(to path: String) {
     guard let sample = SpriteSheet.named("pikachu") else { return }
     // (mood, tick, walkX, hovering, Poké Ball animation caught at ~half way)
-    let moods: [(Mood, Int, CGFloat, Bool, Transition.Kind?)] = [
-        (.idle, 0, 0, false, nil), (.idle, 2, 0, true, nil), (.working, 2, 12, false, nil),
-        (.working, 4, -12, false, nil), (.alert, 4, 0, false, nil), (.alert, 3, 0, false, nil), (.done, 3, 0, false, nil),
-        (.sleeping, 0, 0, false, nil), (.stored, 4, 0, true, nil), (.stored, 10, 0, false, .recall),
-        (.idle, 10, 0, false, .release),
+    // (mood, tick, walkX, hovering, Poké Ball animation caught at ~half way, context used)
+    let moods: [(Mood, Int, CGFloat, Bool, Transition.Kind?, Double?)] = [
+        (.idle, 0, 0, false, nil, nil), (.idle, 2, 0, true, nil, nil), (.working, 2, 12, false, nil, nil),
+        (.working, 4, -12, false, nil, nil), (.alert, 4, 0, false, nil, nil), (.alert, 3, 0, false, nil, nil),
+        (.done, 3, 0, false, nil, nil), (.sleeping, 0, 0, false, nil, nil), (.stored, 4, 0, true, nil, nil),
+        (.stored, 10, 0, false, .recall, nil), (.idle, 10, 0, false, .release, nil),
+        (.idle, 0, 0, true, nil, 0.3), (.working, 2, 12, true, nil, 0.65), (.idle, 0, 0, false, nil, 0.93),
+        (.stored, 0, 0, false, nil, 0.85),
     ]
     let cell = NSSize(width: PetView.width, height: PetView.height(for: sample))
     let rows = (roster.count + 7) / 8
@@ -1617,7 +1694,7 @@ func renderSheet(to path: String) {
     NSColor(white: 0.9, alpha: 1).setFill()
     NSRect(origin: .zero, size: size).fill()
 
-    for (i, (mood, tick, walkX, hover, transition)) in moods.enumerated() {
+    for (i, (mood, tick, walkX, hover, transition, context)) in moods.enumerated() {
         let agent = Agent(pane: "w1:p1", status: "idle", title: "", project: "side-quest")
         let view = PetView(agent: agent, pokemon: "pikachu", sheet: sample)
         view.mood = mood
@@ -1626,6 +1703,7 @@ func renderSheet(to path: String) {
         view.walkDirection = walkX < 0 ? -1 : 1
         view.hovering = hover
         view.transition = transition.map { Transition(kind: $0, start: tick - Transition.ticks / 2) }
+        view.contextUsed = context
         guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
         view.cacheDisplay(in: view.bounds, to: rep)
         rep.draw(in: NSRect(x: CGFloat(i) * cell.width, y: size.height - cell.height,
@@ -1646,7 +1724,75 @@ func renderSheet(to path: String) {
 /// herdr's agents in its sidebar order, then Claude sessions outside herdr, oldest first.
 func currentAgents() -> [Agent] {
     let herdr = Herdr.agents()
-    return (herdr ?? []) + HookSessions.agents(herdrRunning: herdr != nil)
+    let records = HookSessions.liveRecords()
+    var agents = (herdr ?? []) + HookSessions.agents(from: records, herdrRunning: herdr != nil)
+    for i in agents.indices {
+        agents[i].contextUsed = Context.used(by: agents[i], records: records)
+    }
+    return agents
+}
+
+// MARK: - Context
+
+/// How full each agent's context window is, from the token counts Claude Code
+/// writes to the session transcript. Uses the same input-only sum as Claude
+/// Code's own context percentage.
+enum Context {
+    /// Token counts by transcript, re-read only when the file changes.
+    private static var cache: [String: (modified: Date, tokens: Int?)] = [:]
+
+    static func used(by agent: Agent, records: [HookSessions.Record]) -> Double? {
+        // A herdr pane's session is whichever reported from that pane most recently.
+        let record = agent.pane.hasPrefix(HookSessions.prefix)
+            ? records.first { HookSessions.prefix + $0.session == agent.pane }
+            : records.filter { $0.herdrPane == agent.pane }.max { $0.updated < $1.updated }
+        guard let record, let path = record.transcript, let tokens = tokens(in: path) else { return nil }
+        return Double(tokens) / Double(window(model: record.model, tokens: tokens))
+    }
+
+    static func tokens(in path: String) -> Int? {
+        guard let modified = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        else { return nil }
+        if let cached = cache[path], cached.modified == modified { return cached.tokens }
+        let tokens = latestTokens(in: path)
+        cache[path] = (modified, tokens)
+        return tokens
+    }
+
+    /// The input tokens of the main conversation's latest reply. nil before the
+    /// first reply, and after a compaction until the next one.
+    static func latestTokens(in path: String) -> Int? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > 524_288 ? size - 524_288 : 0)
+        let tail = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self)
+        for line in tail.split(separator: "\n").reversed() {
+            if line.contains("\"subtype\":\"compact_boundary\"") { return nil }
+            guard line.contains("\"type\":\"assistant\""), line.contains("\"usage\""),
+                  !line.contains("\"isSidechain\":true"),
+                  let json = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let usage = (json["message"] as? [String: Any])?["usage"] as? [String: Any] else { continue }
+            let tokens = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+                .reduce(0) { $0 + ((usage[$1] as? Int) ?? 0) }
+            if tokens > 0 { return tokens } // skip error placeholders with empty usage
+        }
+        return nil
+    }
+
+    /// 1M for extended-context sessions, otherwise 200k. Transcripts don't say
+    /// which, so: past 200k it must be 1M; below that, the session's model if
+    /// SessionStart reported it, else the default model in Claude Code's settings.
+    static func window(model: String?, tokens: Int) -> Int {
+        if tokens > 200_000 { return 1_000_000 }
+        return (model ?? defaultModel() ?? "").contains("[1m]") ? 1_000_000 : 200_000
+    }
+
+    static func defaultModel() -> String? {
+        guard let data = FileManager.default.contents(atPath: NSHomeDirectory() + "/.claude/settings.json"),
+              let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return settings["model"] as? String
+    }
 }
 
 @main
@@ -1659,7 +1805,8 @@ struct ClaudePet {
         }
         if args.contains("--status") {
             for agent in currentAgents() {
-                print(agent.pane, agent.status, agent.project, agent.app ?? "")
+                let context = agent.contextUsed.map { "ctx \(Int(($0 * 100).rounded()))%" } ?? "ctx ?"
+                print(agent.pane, agent.status, agent.project, context, agent.app ?? "")
             }
             return
         }

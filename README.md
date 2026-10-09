@@ -88,7 +88,10 @@ send a message in a session that was already open to see its pet.
 - **Click** a pet to jump to its session: it brings that terminal forward, and
   clears the "is done".
 - **Drag** a pet anywhere. It stays where you leave it.
-- **Hover** over a pet to see which project it belongs to.
+- **Hover** over a pet to see which project it belongs to, and a CTX bar in
+  the style of FireRed's HP bar showing how much of its session's context
+  window is left. It drains from green to yellow to red, and once a session
+  is over 80% full the bar stays up without hovering.
 - **Right-click** a pet for:
   - **Go to Agent**
   - **Pokemon**: pick a different one from a grid of every sprite. The ones

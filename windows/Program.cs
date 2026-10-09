@@ -52,7 +52,11 @@ static class Program
         if (args.Contains("--status"))
         {
             Win32.AttachConsole(-1); // print into the terminal that ran us
-            foreach (var agent in Agents.Current()) Console.WriteLine($"{agent.Pane} {agent.Status} {agent.Project}");
+            foreach (var agent in Agents.Current())
+            {
+                var context = agent.ContextUsed is double used ? $"ctx {Math.Round(used * 100)}%" : "ctx ?";
+                Console.WriteLine($"{agent.Pane} {agent.Status} {agent.Project} {context}");
+            }
             return 0;
         }
         if (args.Contains("--toggle"))
@@ -306,6 +310,8 @@ sealed class SpriteSheet
 sealed record Agent(string Pane, string Status, string Title, string Project, int? Pid = null)
 {
     public string Label => Title.Length == 0 ? Project : $"{Project}: {Title}";
+    /// How full its context window is, 0 to 1, when known.
+    public double? ContextUsed { get; init; }
 }
 
 static class Agents
@@ -314,7 +320,10 @@ static class Agents
     public static List<Agent> Current()
     {
         var herdr = Herdr.Agents();
-        return (herdr ?? new List<Agent>()).Concat(HookSessions.Agents(herdrRunning: herdr != null)).ToList();
+        var records = HookSessions.LiveRecords();
+        return (herdr ?? new List<Agent>()).Concat(HookSessions.Agents(records, herdrRunning: herdr != null))
+            .Select(agent => agent with { ContextUsed = Context.Used(agent, records) })
+            .ToList();
     }
 
     /// Switches to an agent: through herdr for its panes, otherwise by bringing its terminal forward.
@@ -591,22 +600,23 @@ static class HookSessions
         record["updated"] = started;
         if (Json.Str(hookEvent["cwd"]) is string cwd) record["cwd"] = cwd;
         if (Json.Str(hookEvent["transcript_path"]) is string transcript) record["transcript"] = transcript;
+        if (Json.Str(hookEvent["model"]) is string model) record["model"] = model; // SessionStart, when included
         record["pid"] = Processes.ClaudePid();
         if (Environment.GetEnvironmentVariable("HERDR_PANE_ID") is string pane) record["herdrPane"] = pane;
         else record.Remove("herdrPane");
         Write(record);
     }
 
-    /// Live sessions, oldest first. Drops ones whose Claude has exited, and
-    /// ones inside herdr while herdr is reporting them itself.
-    public static List<Agent> Agents(bool herdrRunning)
+    /// Every live session's record, oldest first. Drops ones whose Claude has
+    /// exited, and settles ones you interrupted.
+    public static List<JsonObject> LiveRecords()
     {
-        if (!Directory.Exists(Paths.Sessions)) return new List<Agent>();
+        if (!Directory.Exists(Paths.Sessions)) return new List<JsonObject>();
         double now = Util.Now();
-        var found = new List<(double Started, Agent Agent)>();
+        var found = new List<JsonObject>();
         foreach (var path in Directory.GetFiles(Paths.Sessions, "*.json"))
         {
-            if (Json.ReadObject(path) is not JsonObject record || Json.Str(record["session"]) is not string session) continue;
+            if (Json.ReadObject(path) is not JsonObject record || Json.Str(record["session"]) == null) continue;
             int pid = (int)Json.Num(record["pid"]);
             bool gone = pid > 0 ? !Processes.IsAlive(pid) : now - Json.Num(record["updated"]) > 86_400;
             if (gone)
@@ -614,19 +624,27 @@ static class HookSessions
                 try { File.Delete(path); } catch { }
                 continue;
             }
-            if (Json.Str(record["herdrPane"]) != null && herdrRunning) continue;
             var status = Json.Str(record["status"]) ?? "idle";
             if ((status == "working" || status == "blocked") && WasInterrupted(record))
             {
-                status = "idle";
-                record["status"] = status;
+                record["status"] = "idle";
                 Write(record);
             }
-            found.Add((Json.Num(record["started"]),
-                new Agent(Prefix + session, status, "", Util.ProjectName(Json.Str(record["cwd"]) ?? ""), pid > 0 ? pid : null)));
+            found.Add(record);
         }
-        return found.OrderBy(f => f.Started).Select(f => f.Agent).ToList();
+        return found.OrderBy(r => Json.Num(r["started"])).ToList();
     }
+
+    /// The sessions as agents, leaving out ones inside herdr while herdr is reporting them itself.
+    public static List<Agent> Agents(List<JsonObject> records, bool herdrRunning) => records
+        .Where(record => !(Json.Str(record["herdrPane"]) != null && herdrRunning))
+        .Select(record =>
+        {
+            int pid = (int)Json.Num(record["pid"]);
+            return new Agent(Prefix + Json.Str(record["session"]), Json.Str(record["status"]) ?? "idle", "",
+                Util.ProjectName(Json.Str(record["cwd"]) ?? ""), pid > 0 ? pid : null);
+        })
+        .ToList();
 
     /// Whether you pressed Esc since the last hook. Claude Code runs no hook
     /// for an interrupt or a denied prompt, but writes a marker to the transcript.
@@ -660,6 +678,74 @@ static class HookSessions
     }
 }
 
+/// How full each agent's context window is, from the token counts in its transcript.
+static class Context
+{
+    /// Token counts by transcript, re-read only when the file changes.
+    static readonly Dictionary<string, (DateTime Modified, int? Tokens)> cache = new();
+
+    public static double? Used(Agent agent, List<JsonObject> records)
+    {
+        // A herdr pane's session is whichever reported from that pane most recently.
+        var record = agent.Pane.StartsWith(HookSessions.Prefix)
+            ? records.FirstOrDefault(r => HookSessions.Prefix + Json.Str(r["session"]) == agent.Pane)
+            : records.Where(r => Json.Str(r["herdrPane"]) == agent.Pane).MaxBy(r => Json.Num(r["updated"]));
+        if (record == null || Json.Str(record["transcript"]) is not string path || Tokens(path) is not int tokens) return null;
+        return tokens / (double)Window(Json.Str(record["model"]), tokens);
+    }
+
+    static int? Tokens(string path)
+    {
+        if (!File.Exists(path)) return null;
+        var modified = File.GetLastWriteTimeUtc(path);
+        if (cache.TryGetValue(path, out var cached) && cached.Modified == modified) return cached.Tokens;
+        var tokens = LatestTokens(path);
+        cache[path] = (modified, tokens);
+        return tokens;
+    }
+
+    /// The input tokens of the main conversation's latest reply. null before the
+    /// first reply, and after a compaction until the next one.
+    static int? LatestTokens(string path)
+    {
+        string tail;
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            stream.Seek(Math.Max(0, stream.Length - 524_288), SeekOrigin.Begin);
+            tail = new StreamReader(stream).ReadToEnd();
+        }
+        catch
+        {
+            return null;
+        }
+        foreach (var line in Enumerable.Reverse(tail.Split('\n')))
+        {
+            if (line.Contains("\"subtype\":\"compact_boundary\"")) return null;
+            if (!line.Contains("\"type\":\"assistant\"") || !line.Contains("\"usage\"") ||
+                line.Contains("\"isSidechain\":true")) continue;
+            JsonObject? usage;
+            try { usage = JsonNode.Parse(line)?["message"]?["usage"] as JsonObject; }
+            catch { continue; }
+            if (usage == null) continue;
+            int tokens = (int)(Json.Num(usage["input_tokens"]) + Json.Num(usage["cache_creation_input_tokens"]) +
+                Json.Num(usage["cache_read_input_tokens"]));
+            if (tokens > 0) return tokens; // skip error placeholders with empty usage
+        }
+        return null;
+    }
+
+    /// 1M for extended-context sessions, otherwise 200k. Transcripts don't say
+    /// which, so: past 200k it must be 1M; below that, the session's model if
+    /// SessionStart reported it, else the default model in Claude Code's settings.
+    static int Window(string? model, int tokens)
+    {
+        if (tokens > 200_000) return 1_000_000;
+        model ??= Json.Str(Json.ReadObject(Paths.ClaudeSettings)?["model"]);
+        return (model ?? "").Contains("[1m]") ? 1_000_000 : 200_000;
+    }
+}
+
 // MARK: - Pet
 
 /// `Stored` is back in its Poke Ball: 12 hours unused, or recalled from the menu.
@@ -684,12 +770,33 @@ static class Look
     public static readonly Brush Pill = Frozen(Color.FromArgb(217, 26, 26, 26));
     public static readonly Brush Shadow = Frozen(Color.FromArgb(46, 0, 0, 0));
 
-    static Brush Frozen(Color color)
+    public static Brush Frozen(Color color)
     {
         var brush = new SolidColorBrush(color);
         brush.Freeze();
         return brush;
     }
+}
+
+/// The colours of FireRed's HP bar, and the pixel letters that replace its "HP".
+static class ContextBar
+{
+    public static readonly Brush Outline = Look.Frozen(Color.FromRgb(41, 43, 51));
+    public static readonly Brush Body = Look.Frozen(Color.FromRgb(71, 71, 79));
+    public static readonly Brush Label = Look.Frozen(Color.FromRgb(247, 176, 48));
+    public static readonly Brush Border = Look.Frozen(Color.FromRgb(247, 247, 247));
+    public static readonly Brush Empty = Look.Frozen(Color.FromRgb(56, 56, 64));
+    /// (light, shade) for more than half left, more than a fifth, and the rest.
+    public static readonly (Brush, Brush) Green = (Look.Frozen(Color.FromRgb(112, 247, 168)), Look.Frozen(Color.FromRgb(71, 199, 120)));
+    public static readonly (Brush, Brush) Yellow = (Look.Frozen(Color.FromRgb(247, 224, 56)), Look.Frozen(Color.FromRgb(199, 168, 8)));
+    public static readonly (Brush, Brush) Red = (Look.Frozen(Color.FromRgb(247, 89, 56)), Look.Frozen(Color.FromRgb(176, 56, 48)));
+    /// "C", "T", "X" in a 3x5 pixel font.
+    public static readonly string[][] Glyphs =
+    {
+        new[] { ".##", "#..", "#..", "#..", ".##" },
+        new[] { "###", ".#.", ".#.", ".#.", ".#." },
+        new[] { "#.#", "#.#", ".#.", "#.#", "#.#" },
+    };
 }
 
 sealed class PetView : FrameworkElement
@@ -897,6 +1004,7 @@ sealed class PetView : FrameworkElement
         if (mood == Mood.Stored && ball != null)
         {
             dc.DrawImage(ball.Frames[0], BallRect(ball));
+            DrawContextBarIfShown(dc, Ground - (ball.Size - ball.Top) * Scale);
             if (hovering) DrawCaption(dc, Summary);
             return;
         }
@@ -949,6 +1057,7 @@ sealed class PetView : FrameworkElement
 
         if (mood == Mood.Working) DrawWorkingDots(dc, rect);
         else if (mood is Mood.Sleeping or Mood.Stored) DrawSnores(dc, rect);
+        DrawContextBarIfShown(dc, Look.SpriteTop + sheet.Top * Scale);
         // One caption under the pet: its status while hovered (or just after it
         // needs you), otherwise "is done" when it has finished.
         if (hovering || Util.Now() < labelUntil) DrawCaption(dc, Summary);
@@ -1047,6 +1156,46 @@ sealed class PetView : FrameworkElement
             dc.Pop();
         }
         dc.Pop();
+    }
+
+    void DrawContextBarIfShown(DrawingContext dc, double headTop)
+    {
+        if (Agent.ContextUsed is double used && (hovering || used >= 0.8)) DrawContextBar(dc, used, headTop);
+    }
+
+    /// A Gen 3 HP bar labelled CTX: it drains as the chat fills its context
+    /// window, from green to yellow below half to red below a fifth.
+    void DrawContextBar(DrawingContext dc, double used, double headTop)
+    {
+        const int width = 42, height = 7, track = 24;
+        double px = Math.Max(1, Math.Round(2 * dpi)) / dpi;
+        double left = Snap(HomeX + SpriteSize / 2 - width * px / 2);
+        double top = Snap(headTop - 3 - height * px);
+        void Fill(Brush brush, int x, int y, int w = 1, int h = 1) =>
+            dc.DrawRectangle(brush, null, new Rect(left + x * px, top + y * px, w * px, h * px));
+
+        // A dark capsule with rounded ends around a grey body.
+        Fill(ContextBar.Outline, 1, 0, width - 2);
+        Fill(ContextBar.Outline, 1, height - 1, width - 2);
+        Fill(ContextBar.Outline, 0, 1, 1, height - 2);
+        Fill(ContextBar.Outline, width - 1, 1, 1, height - 2);
+        Fill(ContextBar.Body, 1, 1, width - 2, height - 2);
+        // "CTX" where the HP label would be.
+        for (int i = 0; i < ContextBar.Glyphs.Length; i++)
+            for (int row = 0; row < 5; row++)
+                for (int col = 0; col < 3; col++)
+                    if (ContextBar.Glyphs[i][row][col] == '#') Fill(ContextBar.Label, 2 + i * 4 + col, 1 + row);
+        // The white-edged track, filled with what's left.
+        Fill(ContextBar.Border, 14, 1, track + 2, 5);
+        Fill(ContextBar.Empty, 15, 2, track, 3);
+        double remaining = Math.Clamp(1 - used, 0, 1);
+        int filled = remaining > 0 ? Math.Max(1, (int)Math.Round(track * remaining)) : 0;
+        var (light, shade) = remaining > 0.5 ? ContextBar.Green : remaining > 0.2 ? ContextBar.Yellow : ContextBar.Red;
+        if (filled > 0)
+        {
+            Fill(light, 15, 2, filled, 2);
+            Fill(shade, 15, 4, filled);
+        }
     }
 
     /// Where the Poke Ball sits: on the ground, centred where the pet stood.
