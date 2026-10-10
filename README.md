@@ -102,6 +102,8 @@ send a message in a session that was already open to see its pet.
   - **Line Up Pets**: a column or a row, in any corner of the screen. Pets are
     spaced by their real size, so a Snorlax gets more room than a Pikachu, and
     ones that are away take no room at all.
+  - **Size**: a slider from small to large, for when the pets are in the
+    way. It holds for a moment at Small, Medium and Large as you drag it.
 
 ![Picking a Pokemon from the right-click menu](docs/picker.png)
 

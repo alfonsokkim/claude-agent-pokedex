@@ -461,9 +461,35 @@ enum LastActive {
     }
 }
 
+/// How big the pets are, from the Size slider in the right-click menu. The
+/// slider moves freely from small to large but holds for a moment at each of
+/// the three sizes on the way.
+enum PetSize {
+    static let small: CGFloat = 1.5, medium: CGFloat = 3, large: CGFloat = 4.5
+    static let locks = [small, medium, large]
+    /// How close the knob has to come to one of the sizes before it holds there.
+    static let pull: CGFloat = 0.3
+
+    /// The slider's position, kept across restarts.
+    static var saved: CGFloat {
+        get {
+            let value = UserDefaults.standard.double(forKey: "petSize")
+            return value == 0 ? medium : min(large, max(small, CGFloat(value)))
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: "petSize") }
+    }
+
+    /// The slider's value, pulled onto a size when it's close to one.
+    static func settle(_ value: CGFloat) -> CGFloat { locks.first { abs($0 - value) <= pull } ?? value }
+
+    /// Points per sprite pixel: whole pixels on a Retina screen, so the pixel art stays crisp.
+    static func scale(for value: CGFloat) -> CGFloat { (value * 2).rounded() / 2 }
+}
+
 final class PetView: NSView {
     static let width: CGFloat = 320
-    static let scale: CGFloat = 3
+    /// Screen points per sprite pixel, from the Size slider (3 is medium).
+    static var scale = PetSize.scale(for: PetSize.saved)
     static func height(for sheet: SpriteSheet) -> CGFloat {
         spriteTop + CGFloat(sheet.frames[0].width) * scale + bottomPad
     }
@@ -498,6 +524,8 @@ final class PetView: NSView {
     var onMoved: ((PetView) -> Void)?
     var onChoosePokemon: ((PetView, String) -> Void)?
     var onLineUp: (() -> Void)?
+    /// Called as the Size slider moves, with its value.
+    var onSize: ((CGFloat) -> Void)?
     /// Called once it has gone into its ball, to close up the gap it leaves.
     var onVanish: (() -> Void)?
     /// Called when it's coming back out, to make room and throw its ball in.
@@ -563,6 +591,12 @@ final class PetView: NSView {
     func setPokemon(_ name: String, sheet: SpriteSheet) {
         pokemon = name
         self.sheet = sheet
+        fitSize()
+    }
+
+    /// Matches the view's height to its sprite at the current size.
+    func fitSize() {
+        setFrameSize(NSSize(width: Self.width, height: Self.height(for: sheet)))
         updateTrackingAreas()
         needsDisplay = true
     }
@@ -852,7 +886,7 @@ final class PetView: NSView {
     /// A Gen 3 HP bar labelled CTX: it drains as the chat fills its context
     /// window, from green to yellow below half to red below a fifth.
     func drawContextBar(used: Double, headTop: CGFloat) {
-        let px: CGFloat = 2, width = 42, height = 7, track = 24
+        let px = max(1, (Self.scale * 4 / 3).rounded() / 2), width = 42, height = 7, track = 24 // 2 at medium
         let left = (homeX + spriteSize / 2 - CGFloat(width) * px / 2).rounded()
         let top = (headTop - 3 - CGFloat(height) * px).rounded()
         func fill(_ color: NSColor, _ x: Int, _ y: Int, _ w: Int = 1, _ h: Int = 1) {
@@ -1101,6 +1135,10 @@ final class PetView: NSView {
         }
         lineUp.submenu = arrange
         menu.addItem(lineUp)
+        let size = NSMenuItem()
+        size.view = SizeSlider(value: PetSize.saved) { [weak self] value in self?.onSize?(value) }
+        menu.addItem(size)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Claude Pet", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
@@ -1115,6 +1153,62 @@ final class PetView: NSView {
         guard let corner = (sender.representedObject as? String).flatMap(Arrangement.Corner.init) else { return }
         Arrangement.saved.corner = corner
         onLineUp?()
+    }
+}
+
+// MARK: - Size slider
+
+/// The Size row in the right-click menu: a slider from Small to Large that
+/// holds briefly at Small, Medium and Large (with a tick on a Force Touch
+/// trackpad), resizing the pets as it moves.
+final class SizeSlider: NSView {
+    let slider: NSSlider
+    let onChange: (CGFloat) -> Void
+    var held: CGFloat?
+
+    init(value: CGFloat, onChange: @escaping (CGFloat) -> Void) {
+        self.onChange = onChange
+        slider = NSSlider(value: Double(value), minValue: Double(PetSize.small), maxValue: Double(PetSize.large),
+                          target: nil, action: nil)
+        held = PetSize.locks.contains(value) ? value : nil
+        super.init(frame: NSRect(x: 0, y: 0, width: 240, height: 62))
+
+        let title = NSTextField(labelWithString: "Size")
+        title.font = .menuFont(ofSize: 0)
+        title.frame = NSRect(x: 21, y: 4, width: 200, height: 18)
+        addSubview(title)
+
+        slider.numberOfTickMarks = PetSize.locks.count
+        slider.allowsTickMarkValuesOnly = false
+        slider.isContinuous = true
+        slider.target = self
+        slider.action = #selector(moved)
+        slider.frame = NSRect(x: 20, y: 22, width: 200, height: 24)
+        addSubview(slider)
+
+        let font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)
+        for (text, alignment) in [("Small", NSTextAlignment.left), ("Medium", .center), ("Large", .right)] {
+            let label = NSTextField(labelWithString: text)
+            label.font = font
+            label.textColor = .secondaryLabelColor
+            label.alignment = alignment
+            label.frame = NSRect(x: 20, y: 44, width: 200, height: 14)
+            addSubview(label)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var isFlipped: Bool { true }
+
+    @objc func moved() {
+        let raw = CGFloat(slider.doubleValue)
+        let value = PetSize.settle(raw)
+        if value != raw { slider.doubleValue = Double(value) }
+        let lock = PetSize.locks.contains(value) ? value : nil
+        if let lock, lock != held { NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now) }
+        held = lock
+        onChange(value)
     }
 }
 
@@ -1494,6 +1588,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.layout()
             }
             pet.onVanish = { [weak self] in self?.layout() }
+            pet.onSize = { [weak self] value in self?.resize(to: value) }
             pet.onSummon = { [weak self] pet in self?.summon(pet) }
             pet.restingPets = { [weak self] in
                 guard let self else { return [] }
@@ -1620,9 +1715,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RunLoop.main.add(timer, forMode: .common)
     }
 
+    /// Resizes every pet for the Size slider, keeping each one's feet where they were.
+    func resize(to value: CGFloat) {
+        PetSize.saved = value
+        let scale = PetSize.scale(for: value)
+        guard scale != PetView.scale else { return }
+        PetView.scale = scale
+        for (pane, pet) in pets {
+            pet.fitSize()
+            guard let panel = panels[pane] else { continue }
+            // Bottom-left stays put, so the ground does too; the line-up then settles.
+            panel.setFrame(NSRect(origin: panel.frame.origin, size: pet.frame.size), display: true)
+        }
+        layout(animated: false) // follows the slider as it moves
+    }
+
     /// Puts dragged pets where they were left, and lines the rest up in agent
     /// order as chosen under Line Up Pets (by default a column in the bottom-right corner).
-    func layout() {
+    func layout(animated: Bool = true) {
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let arrangement = Arrangement.saved
         let saved = positions
@@ -1637,7 +1747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let point = saved[pet.pokemon].map(NSPointFromString),
                NSScreen.screens.contains(where: { $0.visibleFrame.contains(point) }) {
-                move(panel, to: point)
+                move(panel, to: point, animated: animated)
             } else {
                 stack.append((pet, panel))
             }
@@ -1647,16 +1757,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // caption covers the z's rising from the one below, and they pass behind it.
         let origins = stackOrigins(stack.map(\.pet), in: visible, arrangement: arrangement)
         for ((_, panel), origin) in zip(stack, origins).reversed() {
-            move(panel, to: origin)
+            move(panel, to: origin, animated: animated)
             panel.orderFrontRegardless()
         }
     }
 
     /// Slides a panel that's already on screen; puts a new one straight in place.
-    func move(_ panel: PetPanel, to point: NSPoint) {
+    func move(_ panel: PetPanel, to point: NSPoint, animated: Bool = true) {
         guard panel.frame.origin != point else { return }
         let frame = NSRect(origin: point, size: panel.frame.size)
-        if placed.contains(ObjectIdentifier(panel)) {
+        if animated && placed.contains(ObjectIdentifier(panel)) {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.25
                 panel.animator().setFrame(frame, display: true)
@@ -2054,7 +2164,10 @@ struct ClaudePet {
             }
             return
         }
-        if args.contains(where: { $0.hasPrefix("--render") }) { PetView.recordsActivity = false }
+        if args.contains(where: { $0.hasPrefix("--render") }) {
+            PetView.recordsActivity = false
+            PetView.scale = PetSize.medium // the docs show the default size
+        }
         if let i = args.firstIndex(of: "--render"), i + 1 < args.count {
             renderSheet(to: args[i + 1])
             return

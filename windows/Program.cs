@@ -171,6 +171,28 @@ static class Prefs
     static void Save() => Json.WriteAtomic(Paths.Prefs, Root.ToJsonString(Json.Pretty));
 }
 
+/// How big the pets are, from the Size slider in the right-click menu. The
+/// slider moves freely from small to large but holds for a moment at each of
+/// the three sizes on the way.
+static class PetSize
+{
+    public const double Small = 1.5, Medium = 3, Large = 4.5;
+    public static readonly double[] Locks = { Small, Medium, Large };
+    /// How close the slider has to come to one of the sizes before it holds there.
+    const double Pull = 0.3;
+
+    /// The slider's position, kept across restarts.
+    public static double Saved
+    {
+        get => double.TryParse(Prefs.Get("settings", "size"), NumberStyles.Float, CultureInfo.InvariantCulture, out var v)
+            ? Math.Clamp(v, Small, Large) : Medium;
+        set => Prefs.Set("settings", "size", value.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// The slider's value, pulled onto a size when it's close to one.
+    public static double Settle(double value) => Locks.FirstOrDefault(l => Math.Abs(l - value) <= Pull, value);
+}
+
 /// When each agent last worked or asked for input, kept across restarts.
 static class LastActive
 {
@@ -809,7 +831,9 @@ readonly struct BallThrow
 
 static class Look
 {
-    public const double Width = 320, SpriteTop = 40, BottomPad = 26, BaseScale = 3, CaptionSize = 12;
+    public const double Width = 320, SpriteTop = 40, BottomPad = 26, CaptionSize = 12;
+    /// Points per sprite pixel before rounding to the screen's pixels, from the Size slider (3 is medium).
+    public static double BaseScale = PetSize.Saved;
     public static readonly Typeface CaptionFace =
         new(new FontFamily("Cascadia Mono, Consolas"), FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
     public static readonly Color HitRed = Color.FromRgb(255, 31, 31);
@@ -862,6 +886,8 @@ sealed class PetView : FrameworkElement
     /// back out, to make room and throw its ball in.
     public Action<PetView>? OnVanish, OnSummon;
     public Action? OnLineUp;
+    /// Called as the Size slider moves, with its value.
+    public Action<double>? OnSize;
     /// The pets resting out of sight, for Let Out.
     public Func<List<PetView>>? RestingPets;
 
@@ -934,6 +960,13 @@ sealed class PetView : FrameworkElement
     {
         Pokemon = name;
         sheet = newSheet;
+        FitSize();
+    }
+
+    /// Matches the view's height to its sprite at the current size; its window follows.
+    public void FitSize()
+    {
+        Height = ViewHeight;
         InvalidateVisual();
     }
 
@@ -1245,7 +1278,7 @@ sealed class PetView : FrameworkElement
     void DrawContextBar(DrawingContext dc, double used, double headTop)
     {
         const int width = 42, height = 7, track = 24;
-        double px = Math.Max(1, Math.Round(2 * dpi)) / dpi;
+        double px = Math.Max(1, Math.Round(2 * Look.BaseScale / 3 * dpi)) / dpi; // 2 at medium
         double left = Snap(HomeX + SpriteSize / 2 - width * px / 2);
         double top = Snap(headTop - 3 - height * px);
         void Fill(Brush brush, int x, int y, int w = 1, int h = 1) =>
@@ -1444,11 +1477,45 @@ sealed class PetView : FrameworkElement
             lineUp.Items.Add(item);
         }
         menu.Items.Add(lineUp);
+        menu.Items.Add(SizeItem());
+        menu.Items.Add(new Separator());
         menu.Items.Add(Item("Quit Claude Pet", () => Application.Current.Shutdown()));
 
         menu.PlacementTarget = this;
         menu.IsOpen = true;
         e.Handled = true;
+    }
+
+    /// The Size row: a slider from Small to Large that holds briefly at Small,
+    /// Medium and Large, resizing the pets as it moves.
+    MenuItem SizeItem()
+    {
+        var slider = new Slider
+        {
+            Minimum = PetSize.Small, Maximum = PetSize.Large, Value = PetSize.Saved, Width = 180,
+            TickPlacement = TickPlacement.BottomRight, Ticks = new DoubleCollection(PetSize.Locks),
+        };
+        bool settling = false;
+        slider.ValueChanged += (_, e) =>
+        {
+            if (settling) return;
+            double value = PetSize.Settle(e.NewValue);
+            if (value != e.NewValue)
+            {
+                settling = true;
+                slider.Value = value;
+                settling = false;
+            }
+            OnSize?.Invoke(value);
+        };
+        var labels = new Grid { Width = 180 };
+        foreach (var (text, align) in new[] { ("Small", HorizontalAlignment.Left), ("Medium", HorizontalAlignment.Center), ("Large", HorizontalAlignment.Right) })
+            labels.Children.Add(new TextBlock { Text = text, HorizontalAlignment = align, FontSize = 11, Opacity = 0.7 });
+        var row = new StackPanel();
+        row.Children.Add(new TextBlock { Text = "Size" });
+        row.Children.Add(slider);
+        row.Children.Add(labels);
+        return new MenuItem { Header = row, StaysOpenOnClick = true };
     }
 
     static MenuItem Item(string header, Action action)
@@ -1848,6 +1915,7 @@ sealed class PetsController
                     Layout();
                 },
                 OnResize = _ => Layout(),
+                OnSize = Resize,
                 OnHoverEnd = _ => Restack(),
                 OnVanish = _ => Layout(),
                 OnSummon = Summon,
@@ -1891,9 +1959,19 @@ sealed class PetsController
         Layout(); // the new Pokemon may be taller or shorter
     }
 
+    /// Resizes every pet for the Size slider; their windows fit them, and the line-up follows.
+    void Resize(double value)
+    {
+        PetSize.Saved = value;
+        if (value == Look.BaseScale) return;
+        Look.BaseScale = value;
+        foreach (var pet in pets.Values) pet.FitSize();
+        Layout(animated: false); // follows the slider as it moves
+    }
+
     /// Puts dragged pets where they were left, and lines the rest up in agent
     /// order as chosen under Line Up Pets (by default a column in the bottom-right corner).
-    void Layout()
+    void Layout(bool animated = true)
     {
         var visible = SystemParameters.WorkArea;
         var arrangement = Arrangement.Saved;
@@ -1909,7 +1987,7 @@ sealed class PetsController
                 continue;
             }
             if (Prefs.Get("positions", pet.Pokemon) is string saved && TryParsePoint(saved, out var point) && OnScreen(point))
-                Move(window, point);
+                Move(window, point, animated);
             else
                 stack.Add((pet, window));
         }
@@ -1919,7 +1997,7 @@ sealed class PetsController
         // caption covers the z's rising from the one below.
         for (int i = stack.Count - 1; i >= 0; i--)
         {
-            Move(stack[i].Window, origins[i]);
+            Move(stack[i].Window, origins[i], animated);
             stack[i].Window.BringToTop();
         }
     }
@@ -1966,7 +2044,7 @@ sealed class PetsController
     }
 
     /// Slides a window that's already on screen; puts a new one straight in place.
-    void Move(PetWindow window, Point to)
+    void Move(PetWindow window, Point to, bool animated = true)
     {
         to = window.Pet.SnapPoint(to);
         if (placed.Add(window))
@@ -1974,6 +2052,14 @@ sealed class PetsController
             window.Left = to.X;
             window.Top = to.Y;
             window.Show();
+            return;
+        }
+        if (!animated)
+        {
+            window.BeginAnimation(Window.LeftProperty, null);
+            window.BeginAnimation(Window.TopProperty, null);
+            window.Left = to.X;
+            window.Top = to.Y;
             return;
         }
         if (window.Left == to.X && window.Top == to.Y) return;
