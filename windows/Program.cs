@@ -463,6 +463,13 @@ static class Win32
     public static void MakeToolWindow(IntPtr window) =>
         SetWindowLong(window, -20 /* GWL_EXSTYLE */, GetWindowLong(window, -20) | 0x08000000 /* NOACTIVATE */ | 0x80 /* TOOLWINDOW */);
 
+    /// A tool window that clicks pass straight through.
+    public static void MakeClickThrough(IntPtr window)
+    {
+        MakeToolWindow(window);
+        SetWindowLong(window, -20, GetWindowLong(window, -20) | 0x20 /* TRANSPARENT */);
+    }
+
     /// Puts a window in front of the other always-on-top windows.
     public static void BringToTop(IntPtr window) =>
         SetWindowPos(window, new IntPtr(-1) /* HWND_TOPMOST */, 0, 0, 0, 0, 0x1 | 0x2 | 0x10 /* NOSIZE NOMOVE NOACTIVATE */);
@@ -748,15 +755,56 @@ static class Context
 
 // MARK: - Pet
 
-/// `Stored` is back in its Poke Ball: 12 hours unused, or recalled from the menu.
+/// `Stored` is back in its Poke Ball and out of sight: 12 hours unused, or
+/// recalled from the menu.
 enum Mood { Idle, Working, Alert, Done, Sleeping, Stored }
 
-/// Going into the Poke Ball (red glow, shrinking) or coming out (white flash).
+/// Going into the Poke Ball (a red glow, shrinking away to nothing) or coming
+/// out of it (a white flash).
 enum TransitionKind { Recall, Release }
 
 readonly record struct Transition(TransitionKind Kind, int Start)
 {
-    public const int Ticks = 6;
+    public int Ticks => Kind == TransitionKind.Recall ? 8 : 6;
+}
+
+/// A Poke Ball's flight from just off the side of the screen onto the spot
+/// where a pet comes out: from the right edge for a pet on the right half of
+/// the screen, the left otherwise. One high arc, spinning, then a small bounce.
+readonly struct BallThrow
+{
+    public readonly Point Start, End; // the ball's top-left corner, on screen
+    public readonly double Arc, Duration;
+    public readonly bool FromRight;
+    /// The arc's share of the flight; the bounce takes the rest.
+    const double ArcShare = 0.82;
+
+    public BallThrow(Rect landing, Rect screen, Rect visible)
+    {
+        FromRight = landing.X + landing.Width / 2 > screen.X + screen.Width / 2;
+        Start = new Point(FromRight ? screen.Right + 2 : screen.Left - landing.Width - 2, Math.Max(landing.Y - 40, visible.Top));
+        End = landing.TopLeft;
+        double distance = Math.Abs(End.X - Start.X);
+        Arc = Math.Max(0, Math.Min(Math.Min(Math.Max(90, distance * 0.3), 200), Math.Min(Start.Y, End.Y) - visible.Top));
+        Duration = Math.Min(1.1, 0.65 + distance / 2000);
+    }
+
+    /// Where the ball is `t` (0 to 1) through its flight, and how many quarter
+    /// turns it has spun clockwise (rolling the way it's going), upright again
+    /// once it lands.
+    public (Point TopLeft, int QuarterTurns) At(double t)
+    {
+        if (t < ArcShare)
+        {
+            double u = t / ArcShare;
+            double x = Start.X + (End.X - Start.X) * u;
+            double y = Start.Y + (End.Y - Start.Y) * u - Arc * 4 * u * (1 - u);
+            int turns = (int)(t * Duration / 0.07);
+            return (new Point(Math.Round(x), Math.Round(y)), FromRight ? -turns : turns);
+        }
+        double v = (t - ArcShare) / (1 - ArcShare);
+        return (new Point(End.X, Math.Round(End.Y - 12 * 4 * v * (1 - v))), 0);
+    }
 }
 
 static class Look
@@ -810,7 +858,12 @@ sealed class PetView : FrameworkElement
     SpriteSheet sheet;
 
     public Action<PetView>? OnMoved, OnPickPokemon, OnResize, OnHoverEnd;
+    /// Once it has gone into its ball, to close up the gap; when it's coming
+    /// back out, to make room and throw its ball in.
+    public Action<PetView>? OnVanish, OnSummon;
     public Action? OnLineUp;
+    /// The pets resting out of sight, for Let Out.
+    public Func<List<PetView>>? RestingPets;
 
     /// How far it paces either side while working: less in a row, where
     /// neighbours stand close enough that they'd walk into each other.
@@ -824,7 +877,14 @@ sealed class PetView : FrameworkElement
     string? previousStatus;
     double? finishedAt;
     Transition? transition;
+    /// While its Poke Ball is in the air there's nothing to draw here yet.
+    bool arriving;
+    /// Set by its first update, so a pet that starts out resting is simply out of sight.
+    bool settled;
     double dpi = 1;
+
+    /// Resting out of sight, once it has gone into its ball.
+    public bool IsGone => mood == Mood.Stored && transition == null;
 
     public PetView(Agent agent, string pokemon, SpriteSheet sheet)
     {
@@ -862,18 +922,13 @@ sealed class PetView : FrameworkElement
     double Snap(double v) => Math.Round(v * dpi) / dpi;
     public Point SnapPoint(Point p) => new(Snap(p.X), Snap(p.Y));
     public string DisplayName => Roster.Display(Pokemon);
-    bool InBall => mood == Mood.Stored && SpriteSheet.Pokeball != null;
 
     /// How far the pet reaches above the ground, from its topmost pixel.
-    public double VisibleHeight => InBall
-        ? (SpriteSheet.Pokeball!.Size - SpriteSheet.Pokeball.Top) * Scale
-        : (sheet.Size - sheet.Top) * Scale;
+    public double VisibleHeight => (sheet.Size - sheet.Top) * Scale;
 
     /// How much room the pet needs across in a row: its sprite at its widest
-    /// plus its pacing room, or just the ball when it's in one.
-    public double FootprintWidth => InBall
-        ? 2 * SpriteSheet.Pokeball!.HalfWidth * Scale
-        : 2 * sheet.HalfWidth * Scale + 2 * Pace;
+    /// plus its pacing room.
+    public double FootprintWidth => 2 * sheet.HalfWidth * Scale + 2 * Pace;
 
     public void SetPokemon(string name, SpriteSheet newSheet)
     {
@@ -898,7 +953,7 @@ sealed class PetView : FrameworkElement
             // herdr's done lasts until the agent is viewed; a plain stop counts briefly.
             double quiet = now - lastBusy;
             if (finishedAt is double at && now - at < (latest.Status == "done" ? 900 : 15)) next = Mood.Done;
-            else if (quiet > 12 * 3600 && SpriteSheet.Pokeball != null) next = Mood.Stored;
+            else if (quiet > 12 * 3600) next = Mood.Stored;
             else if (quiet > 600) next = Mood.Sleeping;
             else next = Mood.Idle;
         }
@@ -913,18 +968,39 @@ sealed class PetView : FrameworkElement
         lastBusy = now;
     }
 
-    /// Changes mood, playing the Poke Ball animation when going in or coming out.
+    /// Changes mood. Going into its ball it glows red and shrinks away; coming
+    /// back out, its ball is thrown in and it pops out where it lands.
     void SetMood(Mood next)
     {
+        if (!settled)
+        {
+            settled = true;
+            mood = next;
+            return;
+        }
+        bool wasGone = IsGone;
         if (next == Mood.Stored && mood != Mood.Stored) transition = new Transition(TransitionKind.Recall, tick);
-        else if (mood == Mood.Stored && next != Mood.Stored) transition = new Transition(TransitionKind.Release, tick);
+        else if (mood == Mood.Stored && next != Mood.Stored)
+        {
+            // Called back mid-recall, it just comes straight back out.
+            transition = wasGone ? null : new Transition(TransitionKind.Release, tick);
+            arriving = wasGone;
+        }
         if (next != mood && next == Mood.Alert) labelUntil = Util.Now() + 5;
-        bool resized = (next == Mood.Stored) != (mood == Mood.Stored);
         mood = next;
-        if (resized) OnResize?.Invoke(this);
+        if (wasGone && next != Mood.Stored) OnSummon?.Invoke(this);
     }
 
-    /// Recalls the pet into its Poke Ball until you click it or its agent gets busy.
+    /// Its ball has landed: out it comes.
+    public void Land()
+    {
+        arriving = false;
+        transition = new Transition(TransitionKind.Release, tick);
+        hopUntil = Util.Now() + 1.6; // a happy hop once it's out
+        InvalidateVisual();
+    }
+
+    /// Recalls the pet into its Poke Ball until you let it out or its agent gets busy.
     public void ReturnToBall()
     {
         lastBusy = 0;
@@ -942,7 +1018,7 @@ sealed class PetView : FrameworkElement
         if (mood is Mood.Stored or Mood.Sleeping)
         {
             SetMood(Mood.Idle);
-            hopUntil = now + 1.4; // a happy hop once it's out
+            if (!arriving) hopUntil = now + 1.4; // a happy hop once it's out
         }
     }
 
@@ -969,6 +1045,15 @@ sealed class PetView : FrameworkElement
     public void Animate()
     {
         tick++;
+        if (transition is Transition t && tick - t.Start >= t.Ticks)
+        {
+            transition = null;
+            if (t.Kind == TransitionKind.Recall)
+            {
+                Hovering = false;
+                OnVanish?.Invoke(this);
+            }
+        }
         const double speed = 2;
         if (mood == Mood.Working)
         {
@@ -990,24 +1075,16 @@ sealed class PetView : FrameworkElement
 
     protected override void OnRender(DrawingContext dc)
     {
-        var ball = SpriteSheet.Pokeball;
-        if (transition is Transition t && ball != null)
+        if (transition is Transition t)
         {
-            double progress = (tick - t.Start) / (double)Transition.Ticks;
+            double progress = (tick - t.Start) / (double)t.Ticks;
             if (progress < 1)
             {
-                DrawTransition(dc, t.Kind, Math.Max(progress, 0), ball);
+                DrawTransition(dc, t.Kind, Math.Max(progress, 0), SpriteSheet.Pokeball);
                 return;
             }
-            transition = null;
         }
-        if (mood == Mood.Stored && ball != null)
-        {
-            dc.DrawImage(ball.Frames[0], BallRect(ball));
-            DrawContextBarIfShown(dc, Ground - (ball.Size - ball.Top) * Scale);
-            if (hovering) DrawCaption(dc, Summary);
-            return;
-        }
+        if (arriving || mood == Mood.Stored) return;
 
         int step = tick / 2 % 2;
         int frame = tick / 6 % 2;
@@ -1199,24 +1276,35 @@ sealed class PetView : FrameworkElement
     }
 
     /// Where the Poke Ball sits: on the ground, centred where the pet stood.
-    Rect BallRect(SpriteSheet ball)
+    public Rect BallRect(SpriteSheet? ball)
     {
-        double size = ball.Size * Scale;
+        double size = (ball?.Size ?? 16) * Scale;
         return new Rect(Snap(HomeX + (SpriteSize - size) / 2), Ground - size, size, size);
     }
 
-    /// Recall shrinks the pet into the ball in a red glow; release pops it out
-    /// of the ball in a white flash and sparkles. `p` runs 0 to 1.
-    void DrawTransition(DrawingContext dc, TransitionKind kind, double p, SpriteSheet ball)
+    /// Recall turns the pet red and shrinks it away to nothing where its ball
+    /// would sit, as red sparkles close in; release pops it out of the ball in
+    /// a white flash and sparkles. `p` runs 0 to 1.
+    void DrawTransition(DrawingContext dc, TransitionKind kind, double p, SpriteSheet? ball)
     {
         var front = sheet.Pixels[0];
         var ballFrame = BallRect(ball);
         if (kind == TransitionKind.Recall)
         {
-            dc.DrawImage(ball.Frames[0], ballFrame);
-            double size = SpriteSize * (1 - p);
-            var rect = new Rect(ballFrame.X + ballFrame.Width / 2 - size / 2, ballFrame.Y + ballFrame.Height / 2 - size / 2, size, size);
-            dc.DrawImage(SpriteSheet.Tinted(front, sheet.Size, Color.FromRgb(255, 51, 51), Math.Min(1, 0.3 + p)), rect);
+            var red = Color.FromRgb(255, 51, 51);
+            // A moment glowing red, then it shrinks, fading over the second half.
+            double shrink = Math.Max(0, (p - 0.25) / 0.75);
+            double size = Math.Round(sheet.Size * (1 - shrink)) * Scale;
+            double centerX = HomeX + SpriteSize / 2, fullMidY = Look.SpriteTop + SpriteSize / 2;
+            double centerY = fullMidY + (ballFrame.Y + ballFrame.Height / 2 - fullMidY) * shrink;
+            if (size > 0)
+            {
+                dc.PushOpacity(Math.Min(1, 2 - 2 * shrink));
+                dc.DrawImage(SpriteSheet.Tinted(front, sheet.Size, red, Math.Min(1, 0.3 + p * 3)),
+                    new Rect(Snap(centerX - size / 2), Snap(centerY - size / 2), size, size));
+                dc.Pop();
+            }
+            if (shrink > 0) DrawSparkles(dc, new Rect(centerX - 8, centerY - 8, 16, 16), 1 - shrink, red, 1 - shrink * 0.7);
         }
         else
         {
@@ -1225,17 +1313,18 @@ sealed class PetView : FrameworkElement
             dc.DrawImage(SpriteSheet.Tinted(front, sheet.Size, Colors.White, 1 - p), rect);
             if (p < 0.5)
             {
-                dc.DrawImage(ball.Frames[0], ballFrame);
+                if (ball != null) dc.DrawImage(ball.Frames[0], ballFrame);
                 DrawSparkles(dc, ballFrame, p * 2);
             }
         }
     }
 
-    /// Eight pixel sparkles flying out of the ball.
-    void DrawSparkles(DrawingContext dc, Rect around, double p)
+    /// Eight pixel sparkles, `p` of the way out from `around`.
+    void DrawSparkles(DrawingContext dc, Rect around, double p, Color? color = null, double? alpha = null)
     {
         double s = Scale, distance = around.Width / 2 + p * 30;
-        var brush = new SolidColorBrush(Color.FromArgb((byte)(255 * (1 - p * 0.6)), 247, 209, 64));
+        var c = color ?? Color.FromRgb(247, 209, 64);
+        var brush = new SolidColorBrush(Color.FromArgb((byte)(255 * (alpha ?? 1 - p * 0.6)), c.R, c.G, c.B));
         for (int i = 0; i < 8; i++)
         {
             double angle = i * Math.PI / 4;
@@ -1311,15 +1400,16 @@ sealed class PetView : FrameworkElement
         menu.Items.Add(new MenuItem { Header = Agent.Label, IsEnabled = false });
         menu.Items.Add(new Separator());
         menu.Items.Add(Item("Go to Agent", Clicked));
-        if (mood == Mood.Stored)
+        var ball = Item("Return to Poke Ball", ReturnToBall);
+        ball.IsEnabled = mood != Mood.Working && mood != Mood.Alert; // a busy agent would pop it straight back out
+        menu.Items.Add(ball);
+        // Let Out: each pet resting out of sight.
+        var resting = RestingPets?.Invoke() ?? new List<PetView>();
+        if (resting.Count > 0)
         {
-            menu.Items.Add(Item("Let Out", Wake));
-        }
-        else if (SpriteSheet.Pokeball != null)
-        {
-            var ball = Item("Return to Poke Ball", ReturnToBall);
-            ball.IsEnabled = mood != Mood.Working && mood != Mood.Alert; // a busy agent would pop it straight back out
-            menu.Items.Add(ball);
+            var letOut = new MenuItem { Header = "Let Out" };
+            foreach (var pet in resting) letOut.Items.Add(Item($"{pet.DisplayName} · {pet.Agent.Label}", pet.Wake));
+            menu.Items.Add(letOut);
         }
         menu.Items.Add(Item("Pokemon…", () => OnPickPokemon?.Invoke(this)));
         menu.Items.Add(new Separator());
@@ -1399,6 +1489,68 @@ sealed class PetWindow : Window
     public void BringToTop()
     {
         if (handle != IntPtr.Zero) Win32.BringToTop(handle);
+    }
+}
+
+/// A see-through window spanning a Poke Ball's whole flight, closed once it lands.
+sealed class ThrowWindow : Window
+{
+    public ThrowWindow(SpriteSheet ball, BallThrow flight, Size size, Func<Point, Point> snap, Action landed)
+    {
+        var corner = snap(new Point(Math.Min(flight.Start.X, flight.End.X), Math.Min(flight.Start.Y, flight.End.Y) - flight.Arc - 16));
+        Left = corner.X;
+        Top = corner.Y;
+        Width = Math.Abs(flight.End.X - flight.Start.X) + size.Width;
+        Height = Math.Max(flight.Start.Y, flight.End.Y) + size.Height - corner.Y;
+        Title = "Claude Pet";
+        WindowStyle = WindowStyle.None;
+        AllowsTransparency = true;
+        Background = Brushes.Transparent;
+        Topmost = true;
+        ShowInTaskbar = false;
+        ShowActivated = false;
+        ResizeMode = ResizeMode.NoResize;
+        IsHitTestVisible = false;
+        SourceInitialized += (_, _) => Win32.MakeClickThrough(new WindowInteropHelper(this).Handle);
+
+        var rotation = new RotateTransform();
+        var image = new Image
+        {
+            Source = ball.Frames[0], Width = size.Width, Height = size.Height,
+            RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = rotation,
+        };
+        RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.NearestNeighbor);
+        var canvas = new Canvas();
+        canvas.Children.Add(image);
+        Content = canvas;
+
+        void Place(double t)
+        {
+            var (at, turns) = flight.At(t);
+            at = snap(at);
+            Canvas.SetLeft(image, at.X - corner.X);
+            Canvas.SetTop(image, at.Y - corner.Y);
+            rotation.Angle = turns * 90;
+        }
+        Place(0);
+        var clock = Stopwatch.StartNew();
+        void Step(object? sender, EventArgs e)
+        {
+            double t = Math.Min(1, clock.Elapsed.TotalSeconds / flight.Duration);
+            Place(t);
+            if (t < 1) return;
+            CompositionTarget.Rendering -= Step;
+            // The pet draws its ball on the same spot, then pops out of it.
+            landed();
+            var close = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+            close.Tick += (_, _) =>
+            {
+                close.Stop();
+                Close();
+            };
+            close.Start();
+        }
+        Loaded += (_, _) => CompositionTarget.Rendering += Step;
     }
 }
 
@@ -1697,6 +1849,9 @@ sealed class PetsController
                 },
                 OnResize = _ => Layout(),
                 OnHoverEnd = _ => Restack(),
+                OnVanish = _ => Layout(),
+                OnSummon = Summon,
+                RestingPets = () => order.Where(pets.ContainsKey).Select(p => pets[p]).Where(p => p.IsGone).ToList(),
             };
             pet.Update(agent);
             pets[agent.Pane] = pet;
@@ -1746,6 +1901,13 @@ sealed class PetsController
         foreach (var pane in order)
         {
             if (!pets.TryGetValue(pane, out var pet) || !windows.TryGetValue(pane, out var window)) continue;
+            if (pet.IsGone)
+            {
+                // Out of sight, taking no room; it's put straight in place when it comes back.
+                window.Hide();
+                placed.Remove(window);
+                continue;
+            }
             if (Prefs.Get("positions", pet.Pokemon) is string saved && TryParsePoint(saved, out var point) && OnScreen(point))
                 Move(window, point);
             else
@@ -1760,6 +1922,40 @@ sealed class PetsController
             Move(stack[i].Window, origins[i]);
             stack[i].Window.BringToTop();
         }
+    }
+
+    /// Pets coming back out this round, thrown in together once all have room.
+    readonly List<PetView> summoning = new();
+
+    /// Brings a resting pet back, along with any others coming out at the same time.
+    void Summon(PetView pet)
+    {
+        summoning.Add(pet);
+        if (summoning.Count > 1) return;
+        Dispatcher.CurrentDispatcher.InvokeAsync(() =>
+        {
+            var coming = summoning.ToList();
+            summoning.Clear();
+            Layout(); // makes room for them all first, so none moves once its ball is in the air
+            foreach (var p in coming) ThrowBall(p);
+        });
+    }
+
+    /// Throws a pet's Poke Ball in from the side of the screen it's on; the pet
+    /// comes out where it lands.
+    void ThrowBall(PetView pet)
+    {
+        if (!windows.TryGetValue(pet.Agent.Pane, out var window) || window.Pet != pet ||
+            SpriteSheet.Pokeball is not SpriteSheet ball)
+        {
+            pet.Land();
+            return;
+        }
+        var spot = pet.BallRect(ball);
+        var landing = new Rect(window.Left + spot.X, window.Top + spot.Y, spot.Width, spot.Height);
+        var screen = new Rect(0, 0, SystemParameters.PrimaryScreenWidth, SystemParameters.PrimaryScreenHeight);
+        var flight = new BallThrow(landing, screen, SystemParameters.WorkArea);
+        new ThrowWindow(ball, flight, spot.Size, pet.SnapPoint, pet.Land).Show();
     }
 
     /// Puts the column's layering back after a hovered pet was brought to the front.

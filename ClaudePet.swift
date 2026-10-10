@@ -117,10 +117,8 @@ struct SpriteSheet {
     }
 }
 
-/// FireRed's overworld item ball (16×16), where pets rest after a long idle.
+/// FireRed's overworld item ball (16×16), thrown in to bring a resting pet back.
 let pokeball = SpriteSheet.frames(in: "\(SpriteSheet.directory)/_pokeball.png")?.first
-let pokeballExtent = pokeball.map(SpriteSheet.visibleExtent) ?? (top: 0, halfWidth: 0)
-let pokeballTop = pokeballExtent.top
 
 /// Draws a sprite with crisp pixels into a flipped view, optionally mirrored or faded.
 func drawPixelSprite(_ image: CGImage, in rect: NSRect, mirrored: Bool = false, alpha: CGFloat = 1) {
@@ -439,12 +437,13 @@ enum HookSessions {
 /// `stored` is back in its Poké Ball: 12 hours unused, or recalled from the menu.
 enum Mood { case idle, working, alert, done, sleeping, stored }
 
-/// Going into the Poké Ball (red glow, shrinking) or coming out (white flash).
+/// Going into the Poké Ball (a red glow, shrinking away to nothing) or coming
+/// out of it (a white flash).
 struct Transition {
     enum Kind { case recall, release }
     let kind: Kind
     let start: Int // tick it began
-    static let ticks = 6
+    var ticks: Int { kind == .recall ? 8 : 6 }
 }
 
 /// When each herdr pane last worked or asked for input, kept across restarts.
@@ -499,8 +498,12 @@ final class PetView: NSView {
     var onMoved: ((PetView) -> Void)?
     var onChoosePokemon: ((PetView, String) -> Void)?
     var onLineUp: (() -> Void)?
-    /// Called when the pet's height changes (into or out of its ball), to restack.
-    var onResize: (() -> Void)?
+    /// Called once it has gone into its ball, to close up the gap it leaves.
+    var onVanish: (() -> Void)?
+    /// Called when it's coming back out, to make room and throw its ball in.
+    var onSummon: ((PetView) -> Void)?
+    /// The pets resting out of sight, for Let Out.
+    var restingPets: (() -> [PetView])?
     /// The Pokémon other live agents have, so the picker can show them as taken.
     var otherPokemon: (() -> Set<String>)?
 
@@ -522,6 +525,13 @@ final class PetView: NSView {
     var finishedAt: Date?
     var contextUsed: Double?
     var transition: Transition?
+    /// While its Poké Ball is in the air there's nothing to draw here yet.
+    var arriving = false
+    /// Set by its first update, so a pet that starts out resting is simply out of sight.
+    var settled = false
+
+    /// Resting out of sight, once it has gone into its ball.
+    var isGone: Bool { mood == .stored && transition == nil }
 
     init(agent: Agent, pokemon: String, sheet: SpriteSheet) {
         self.agent = agent
@@ -578,7 +588,7 @@ final class PetView: NSView {
             if let at = finishedAt,
                now.timeIntervalSince(at) < (latest.status == "done" ? 900 : 15) {
                 next = .done
-            } else if quiet > 12 * 3600 && pokeball != nil {
+            } else if quiet > 12 * 3600 {
                 next = .stored
             } else if quiet > 600 {
                 next = .sleeping
@@ -590,42 +600,46 @@ final class PetView: NSView {
         setMood(next)
     }
 
-    /// Changes mood, playing the Poké Ball animation when going in or coming out.
+    /// Changes mood. Going into its ball it glows red and shrinks away; coming
+    /// back out, its ball is thrown in and it pops out where it lands.
     func setMood(_ next: Mood) {
+        guard settled else {
+            settled = true
+            mood = next
+            return
+        }
+        let wasGone = isGone
         if next == .stored && mood != .stored {
             transition = Transition(kind: .recall, start: tick)
         } else if mood == .stored && next != .stored {
-            transition = Transition(kind: .release, start: tick)
+            // Called back mid-recall, it just comes straight back out.
+            transition = wasGone ? nil : Transition(kind: .release, start: tick)
+            arriving = wasGone
         }
         if next != mood && next == .alert { // done has its own caption
             labelUntil = Date().addingTimeInterval(5)
         }
-        let resized = (next == .stored) != (mood == .stored)
         mood = next
-        if resized {
-            updateTrackingAreas() // the ball is much smaller than the pet
-            onResize?()
-        }
+        if wasGone && next != .stored { onSummon?(self) }
+    }
+
+    /// Its ball has landed: out it comes.
+    func land() {
+        arriving = false
+        transition = Transition(kind: .release, start: tick)
+        hopUntil = Date().addingTimeInterval(1.6) // a happy hop once it's out
+        updateTrackingAreas()
+        needsDisplay = true
     }
 
     /// How far the pet reaches above the ground in points, from its topmost pixel.
-    var visibleHeight: CGFloat {
-        if mood == .stored, let pokeball {
-            return CGFloat(pokeball.height - pokeballTop) * Self.scale
-        }
-        return CGFloat(sheet.frames[0].height - sheet.top) * Self.scale
-    }
+    var visibleHeight: CGFloat { CGFloat(sheet.frames[0].height - sheet.top) * Self.scale }
 
     /// How much room the pet needs across, for lining up in a row: its sprite at
-    /// its widest plus its pacing room, or just the ball when it's in one.
-    var footprintWidth: CGFloat {
-        if mood == .stored, pokeball != nil {
-            return CGFloat(2 * pokeballExtent.halfWidth) * Self.scale
-        }
-        return CGFloat(2 * sheet.halfWidth) * Self.scale + 2 * pace
-    }
+    /// its widest plus its pacing room.
+    var footprintWidth: CGFloat { CGFloat(2 * sheet.halfWidth) * Self.scale + 2 * pace }
 
-    /// Recalls the pet into its Poké Ball until you click it or its agent gets busy.
+    /// Recalls the pet into its Poké Ball until you let it out or its agent gets busy.
     @objc func returnToBall() {
         lastBusy = .distantPast
         LastActive.set(agent.pane, .distantPast)
@@ -640,7 +654,7 @@ final class PetView: NSView {
         LastActive.set(agent.pane, now)
         if mood == .stored || mood == .sleeping {
             setMood(.idle)
-            hopUntil = now.addingTimeInterval(1.4) // a happy hop once it's out
+            if !arriving { hopUntil = now.addingTimeInterval(1.4) } // a happy hop once it's out
         }
     }
 
@@ -658,6 +672,13 @@ final class PetView: NSView {
     /// Advances one animation step: walks while working, and walks home after.
     func animate() {
         tick += 1
+        if let transition, tick - transition.start >= transition.ticks {
+            self.transition = nil
+            if transition.kind == .recall {
+                hovering = false
+                onVanish?()
+            }
+        }
         let speed: CGFloat = 2
         if mood == .working {
             walkX += walkDirection * speed
@@ -672,18 +693,14 @@ final class PetView: NSView {
     // MARK: Drawing
 
     override func draw(_ dirtyRect: NSRect) {
-        if let transition, let pokeball {
-            let progress = CGFloat(tick - transition.start) / CGFloat(Transition.ticks)
+        if let transition {
+            let progress = CGFloat(tick - transition.start) / CGFloat(transition.ticks)
             if progress < 1 {
                 drawTransition(transition.kind, progress: max(progress, 0), ball: pokeball)
                 return
             }
-            self.transition = nil
         }
-        if mood == .stored, let pokeball {
-            drawStored(pokeball)
-            return
-        }
+        if arriving || mood == .stored { return }
         let frames = sheet.frames
         let step = tick / 2 % 2
         var image = frames[tick / 6 % 2]
@@ -819,18 +836,10 @@ final class PetView: NSView {
     }
 
     /// Where the Poké Ball sits: on the ground, centred where the pet stood.
-    func ballRect(_ ball: CGImage) -> NSRect {
-        let size = CGFloat(ball.width) * Self.scale
+    func ballRect(_ ball: CGImage?) -> NSRect {
+        let size = CGFloat(ball?.width ?? 16) * Self.scale
         return NSRect(x: homeX + (spriteSize - size) / 2, y: Self.spriteTop + spriteSize - size,
                       width: size, height: size)
-    }
-
-    /// The Poké Ball on the spot where the pet stood.
-    func drawStored(_ ball: CGImage) {
-        let rect = ballRect(ball)
-        drawSprite(ball, in: rect, mirrored: false)
-        drawContextBarIfShown(headTop: ground - CGFloat(ball.height - pokeballTop) * Self.scale)
-        if hovering { drawCaption(summary) }
     }
 
     /// The CTX bar above the pet's head, while you hover over it or once its
@@ -875,35 +884,48 @@ final class PetView: NSView {
         }
     }
 
-    /// Recall shrinks the pet into the ball in a red glow; release pops it
-    /// out of the ball in a white flash and sparkles. `progress` runs 0 → 1.
-    func drawTransition(_ kind: Transition.Kind, progress p: CGFloat, ball: CGImage) {
+    /// Recall turns the pet red and shrinks it away to nothing where its ball
+    /// would sit, as red sparkles close in; release pops it out of the ball in
+    /// a white flash and sparkles. `progress` runs 0 → 1.
+    func drawTransition(_ kind: Transition.Kind, progress p: CGFloat, ball: CGImage?) {
         let front = sheet.frames[0]
+        let full = NSRect(x: homeX, y: Self.spriteTop, width: spriteSize, height: spriteSize)
         let ballFrame = ballRect(ball)
-        let full = NSRect(x: homeX, y: Self.spriteTop,
-                          width: spriteSize, height: spriteSize)
 
         switch kind {
         case .recall:
-            drawSprite(ball, in: ballFrame, mirrored: false)
-            let size = spriteSize * (1 - p)
-            let rect = NSRect(x: ballFrame.midX - size / 2, y: ballFrame.midY - size / 2, width: size, height: size)
-            drawTinted(front, in: rect, color: NSColor(srgbRed: 1, green: 0.2, blue: 0.2, alpha: 1),
-                       amount: min(1, 0.3 + p))
+            let red = NSColor(srgbRed: 1, green: 0.2, blue: 0.2, alpha: 1)
+            // A moment glowing red, then it shrinks, fading over the second half.
+            let shrink = max(0, (p - 0.25) / 0.75)
+            let size = (spriteSize * (1 - shrink) / Self.scale).rounded() * Self.scale
+            let center = NSPoint(x: full.midX, y: full.midY + (ballFrame.midY - full.midY) * shrink)
+            let rect = NSRect(x: (center.x - size / 2).rounded(), y: (center.y - size / 2).rounded(),
+                              width: size, height: size)
+            if size > 0 {
+                drawTinted(front, in: rect, color: red, amount: min(1, 0.3 + p * 3), alpha: min(1, 2 - 2 * shrink))
+            }
+            if shrink > 0 {
+                drawSparkles(around: NSRect(x: center.x - 8, y: center.y - 8, width: 16, height: 16),
+                             progress: 1 - shrink, color: red, alpha: 1 - shrink * 0.7)
+            }
         case .release:
             let size = spriteSize * (0.3 + 0.7 * p)
             let rect = NSRect(x: full.midX - size / 2, y: full.maxY - size, width: size, height: size)
             drawTinted(front, in: rect, color: .white, amount: 1 - p)
             if p < 0.5 {
-                drawSprite(ball, in: ballFrame, mirrored: false)
+                if let ball { drawSprite(ball, in: ballFrame, mirrored: false) }
                 drawSparkles(around: ballFrame, progress: p * 2)
             }
         }
     }
 
     /// The sprite washed with a colour, keeping its silhouette.
-    func drawTinted(_ image: CGImage, in rect: NSRect, color: NSColor, amount: CGFloat, mirrored: Bool = false) {
+    func drawTinted(_ image: CGImage, in rect: NSRect, color: NSColor, amount: CGFloat, mirrored: Bool = false,
+                    alpha: CGFloat = 1) {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.setAlpha(alpha)
         context.beginTransparencyLayer(auxiliaryInfo: nil)
         drawSprite(image, in: rect, mirrored: mirrored)
         if amount > 0 {
@@ -914,15 +936,16 @@ final class PetView: NSView {
         context.endTransparencyLayer()
     }
 
-    /// Eight pixel sparkles flying out of the ball.
-    func drawSparkles(around rect: NSRect, progress p: CGFloat) {
+    /// Eight pixel sparkles, `progress` of the way out from `rect`.
+    func drawSparkles(around rect: NSRect, progress p: CGFloat, color: NSColor? = nil, alpha: CGFloat? = nil) {
         let s = Self.scale
         let distance = rect.width / 2 + p * 30
-        NSColor(srgbRed: 0.97, green: 0.82, blue: 0.25, alpha: 1 - p * 0.6).setFill()
+        (color ?? NSColor(srgbRed: 0.97, green: 0.82, blue: 0.25, alpha: 1))
+            .withAlphaComponent(alpha ?? 1 - p * 0.6).setFill()
         for i in 0..<8 {
             let angle = CGFloat(i) * .pi / 4
-            let x = (rect.midX + cos(angle) * distance / s).rounded() * s
-            let y = (rect.midY + sin(angle) * distance / s).rounded() * s
+            let x = ((rect.midX + cos(angle) * distance) / s).rounded() * s
+            let y = ((rect.midY + sin(angle) * distance) / s).rounded() * s
             // A small pixel "+".
             NSRect(x: x - s, y: y, width: 3 * s, height: s).fill()
             NSRect(x: x, y: y - s, width: s, height: 3 * s).fill()
@@ -956,11 +979,11 @@ final class PetView: NSView {
     var windowStart: NSPoint?
     var dragged = false
 
-    /// Just the part of the window the pet covers: its sprite's real width (or
-    /// only the ball) from its top pixel down to its feet. Neighbours packed
-    /// close together never share any of it.
+    /// Just the part of the window the pet covers: its sprite's real width
+    /// from its top pixel down to its feet. Neighbours packed close together
+    /// never share any of it.
     var hoverRect: NSRect {
-        let half = CGFloat(mood == .stored && pokeball != nil ? pokeballExtent.halfWidth : sheet.halfWidth) * Self.scale
+        let half = CGFloat(sheet.halfWidth) * Self.scale
         let top = ground - visibleHeight
         return NSRect(x: homeX + spriteSize / 2 - half, y: top, width: 2 * half, height: visibleHeight)
     }
@@ -1023,16 +1046,23 @@ final class PetView: NSView {
         go.target = self
         menu.addItem(go)
 
-        if mood == .stored {
-            let out = NSMenuItem(title: "Let Out", action: #selector(wake), keyEquivalent: "")
-            out.target = self
+        let ball = NSMenuItem(title: "Return to Poké Ball", action: #selector(returnToBall), keyEquivalent: "")
+        ball.target = self
+        // A busy agent would pop it straight back out.
+        ball.isEnabled = mood != .working && mood != .alert
+        menu.addItem(ball)
+        // Let Out ▸ each pet resting out of sight.
+        let resting = restingPets?() ?? []
+        if !resting.isEmpty {
+            let out = NSMenuItem(title: "Let Out", action: nil, keyEquivalent: "")
+            let list = NSMenu()
+            for pet in resting {
+                let item = NSMenuItem(title: "\(pet.name) · \(pet.agent.label)", action: #selector(wake), keyEquivalent: "")
+                item.target = pet
+                list.addItem(item)
+            }
+            out.submenu = list
             menu.addItem(out)
-        } else if pokeball != nil {
-            let ball = NSMenuItem(title: "Return to Poké Ball", action: #selector(returnToBall), keyEquivalent: "")
-            ball.target = self
-            // A busy agent would pop it straight back out.
-            ball.isEnabled = mood != .working && mood != .alert
-            menu.addItem(ball)
         }
 
         let choose = NSMenuItem(title: "Pokémon", action: nil, keyEquivalent: "")
@@ -1303,6 +1333,76 @@ func stackOrigins(_ pets: [PetView], in visible: NSRect, arrangement: Arrangemen
 
 // MARK: - App
 
+/// A Poké Ball's flight from just off the side of the screen onto the spot
+/// where a pet comes out: from the right edge for a pet on the right half of
+/// the screen, the left otherwise. One high arc, spinning, then a small bounce.
+struct BallThrow {
+    let start: NSPoint, end: NSPoint // the ball's bottom-left corner, on screen
+    let arc: CGFloat
+    let duration: CFTimeInterval
+    let fromRight: Bool
+    /// The arc's share of the flight; the bounce takes the rest.
+    static let arcShare: CGFloat = 0.82
+
+    init(onto landing: NSRect, screen: NSRect, visible: NSRect) {
+        fromRight = landing.midX > screen.midX
+        let top = visible.maxY - landing.height // under the menu bar
+        start = NSPoint(x: fromRight ? screen.maxX + 2 : screen.minX - landing.width - 2,
+                        y: min(landing.minY + 40, top))
+        end = landing.origin
+        let distance = abs(end.x - start.x)
+        arc = max(0, min(max(90, distance * 0.3), 200, top - max(start.y, end.y)))
+        duration = min(1.1, 0.65 + distance / 2000)
+    }
+
+    /// Where the ball is `t` (0 to 1) through its flight, and how many quarter
+    /// turns it has spun clockwise (rolling the way it's going), upright again
+    /// once it lands.
+    func position(at t: CGFloat) -> (origin: NSPoint, quarterTurns: Int) {
+        if t < Self.arcShare {
+            let u = t / Self.arcShare
+            let point = NSPoint(x: start.x + (end.x - start.x) * u,
+                                y: start.y + (end.y - start.y) * u + arc * 4 * u * (1 - u))
+            let turns = Int(Double(t) * duration / 0.07)
+            return (NSPoint(x: point.x.rounded(), y: point.y.rounded()), fromRight ? -turns : turns)
+        }
+        let u = (t - Self.arcShare) / (1 - Self.arcShare)
+        return (NSPoint(x: end.x, y: (end.y + 12 * 4 * u * (1 - u)).rounded()), 0)
+    }
+}
+
+/// Draws the Poké Ball turned by quarter turns clockwise in a flipped view,
+/// keeping its pixels square.
+func drawBall(_ ball: CGImage, in rect: NSRect, quarterTurns: Int) {
+    guard let context = NSGraphicsContext.current?.cgContext else { return }
+    context.saveGState()
+    context.translateBy(x: rect.midX, y: rect.midY)
+    context.rotate(by: CGFloat(quarterTurns) * .pi / 2)
+    context.translateBy(x: -rect.midX, y: -rect.midY)
+    drawPixelSprite(ball, in: rect)
+    context.restoreGState()
+}
+
+/// The thrown ball, in a window spanning its whole flight.
+final class BallThrowView: NSView {
+    let ball: CGImage
+    var ballRect = NSRect.zero
+    var quarterTurns = 0
+
+    init(ball: CGImage, frame: NSRect) {
+        self.ball = ball
+        super.init(frame: frame)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        drawBall(ball, in: ballRect, quarterTurns: quarterTurns)
+    }
+}
+
 /// Borderless panels can't normally take clicks without stealing focus; these never become key.
 final class PetPanel: NSPanel {
     override var canBecomeKey: Bool { false }
@@ -1393,7 +1493,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.positions = [:]
                 self?.layout()
             }
-            pet.onResize = { [weak self] in self?.layout() }
+            pet.onVanish = { [weak self] in self?.layout() }
+            pet.onSummon = { [weak self] pet in self?.summon(pet) }
+            pet.restingPets = { [weak self] in
+                guard let self else { return [] }
+                return self.order.compactMap { self.pets[$0] }.filter(\.isGone)
+            }
             pet.otherPokemon = { [weak self, weak pet] in
                 Set(self?.pets.values.filter { $0 !== pet }.map(\.pokemon) ?? [])
             }
@@ -1441,9 +1546,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panel.hidesOnDeactivate = false
+        panel.animationBehavior = .none // it comes and goes with its own animations
         panel.contentView = pet
-        panel.orderFrontRegardless()
+        if !pet.isGone { panel.orderFrontRegardless() }
         return panel
+    }
+
+    /// Pets coming back out this round, thrown in together once all have room.
+    var summoning: [PetView] = []
+
+    /// Brings a resting pet back, along with any others coming out at the same time.
+    func summon(_ pet: PetView) {
+        summoning.append(pet)
+        guard summoning.count == 1 else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let pets = summoning
+            summoning = []
+            layout() // makes room for them all first, so none moves once its ball is in the air
+            pets.forEach(throwBall)
+        }
+    }
+
+    /// Throws a pet's Poké Ball in from the side of the screen it's on; the pet
+    /// comes out where it lands.
+    func throwBall(for pet: PetView) {
+        guard let panel = panels[pet.agent.pane], panel.contentView === pet else { return pet.land() }
+        panel.orderFrontRegardless()
+        let landing = panel.convertToScreen(pet.convert(pet.ballRect(pokeball), to: nil))
+        guard let ball = pokeball,
+              let screen = NSScreen.screens.first(where: { $0.frame.contains(NSPoint(x: landing.midX, y: landing.midY)) })
+                ?? NSScreen.main else { return pet.land() }
+        let flight = BallThrow(onto: landing, screen: screen.frame, visible: screen.visibleFrame)
+
+        // A window spanning the whole flight, from just off the edge to the landing spot.
+        let span = NSRect(x: min(flight.start.x, flight.end.x), y: min(flight.start.y, flight.end.y),
+                          width: abs(flight.end.x - flight.start.x) + landing.width,
+                          height: abs(flight.end.y - flight.start.y) + flight.arc + 16 + landing.height)
+        let window = PetPanel(contentRect: span, styleMask: [.borderless, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.animationBehavior = .none // no zoom in or fade out, which would blur the pixels
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        let view = BallThrowView(ball: ball, frame: NSRect(origin: .zero, size: span.size))
+        window.contentView = view
+
+        func show(_ t: CGFloat) {
+            let (origin, turns) = flight.position(at: t)
+            // The view is flipped: measured down from the window's top.
+            view.ballRect = NSRect(x: origin.x - span.minX, y: span.maxY - origin.y - landing.height,
+                                   width: landing.width, height: landing.height)
+            view.quarterTurns = turns
+            view.needsDisplay = true
+        }
+        show(0)
+        window.orderFrontRegardless()
+        let began = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                let t = min(1, CGFloat((CACurrentMediaTime() - began) / flight.duration))
+                show(t)
+                guard t >= 1 else { return }
+                timer.invalidate()
+                // The pet draws its ball on the same spot, then pops out of it.
+                pet.land()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { window.orderOut(nil) }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     /// Puts dragged pets where they were left, and lines the rest up in agent
@@ -1455,6 +1629,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var stack: [(pet: PetView, panel: PetPanel)] = []
         for pane in order {
             guard let pet = pets[pane], let panel = panels[pane] else { continue }
+            if pet.isGone {
+                // Out of sight, taking no room; it's put straight in place when it comes back.
+                panel.orderOut(nil)
+                placed.remove(ObjectIdentifier(panel))
+                continue
+            }
             if let point = saved[pet.pokemon].map(NSPointFromString),
                NSScreen.screens.contains(where: { $0.visibleFrame.contains(point) }) {
                 move(panel, to: point)
@@ -1666,23 +1846,25 @@ func renderDesktop(background path: String, to out: String, arrangement: Arrange
     try? canvas.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
 }
 
-/// Renders every mood (top row) and the whole roster into a PNG.
+/// Renders every mood (top row), the whole roster, and a Poké Ball thrown in
+/// from the right edge (bottom strip, every few frames) into a PNG.
 @MainActor
 func renderSheet(to path: String) {
     guard let sample = SpriteSheet.named("pikachu") else { return }
-    // (mood, tick, walkX, hovering, Poké Ball animation caught at ~half way)
-    // (mood, tick, walkX, hovering, Poké Ball animation caught at ~half way, context used)
-    let moods: [(Mood, Int, CGFloat, Bool, Transition.Kind?, Double?)] = [
+    // (mood, tick, walkX, hovering, Poké Ball animation and how far through, context used)
+    let moods: [(Mood, Int, CGFloat, Bool, (Transition.Kind, Int)?, Double?)] = [
         (.idle, 0, 0, false, nil, nil), (.idle, 2, 0, true, nil, nil), (.working, 2, 12, false, nil, nil),
         (.working, 4, -12, false, nil, nil), (.alert, 4, 0, false, nil, nil), (.alert, 3, 0, false, nil, nil),
-        (.done, 3, 0, false, nil, nil), (.sleeping, 0, 0, false, nil, nil), (.stored, 4, 0, true, nil, nil),
-        (.stored, 10, 0, false, .recall, nil), (.idle, 10, 0, false, .release, nil),
+        (.done, 3, 0, false, nil, nil), (.sleeping, 0, 0, false, nil, nil),
+        (.stored, 10, 0, false, (.recall, 1), nil), (.stored, 10, 0, false, (.recall, 4), nil),
+        (.stored, 10, 0, false, (.recall, 6), nil), (.idle, 10, 0, false, (.release, 1), nil),
+        (.idle, 10, 0, false, (.release, 3), nil),
         (.idle, 0, 0, true, nil, 0.3), (.working, 2, 12, true, nil, 0.65), (.idle, 0, 0, false, nil, 0.93),
-        (.stored, 0, 0, false, nil, 0.85),
     ]
     let cell = NSSize(width: PetView.width, height: PetView.height(for: sample))
     let rows = (roster.count + 7) / 8
-    let size = NSSize(width: cell.width * CGFloat(moods.count), height: cell.height + CGFloat(rows) * 110)
+    let strip = NSSize(width: 900, height: 260)
+    let size = NSSize(width: cell.width * CGFloat(moods.count), height: cell.height + CGFloat(rows) * 110 + strip.height)
     guard let sheet = NSBitmapImageRep(
         bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -1702,7 +1884,7 @@ func renderSheet(to path: String) {
         view.walkX = walkX
         view.walkDirection = walkX < 0 ? -1 : 1
         view.hovering = hover
-        view.transition = transition.map { Transition(kind: $0, start: tick - Transition.ticks / 2) }
+        view.transition = transition.map { Transition(kind: $0.0, start: tick - $0.1) }
         view.contextUsed = context
         guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
         view.cacheDisplay(in: view.bounds, to: rep)
@@ -1716,6 +1898,22 @@ func renderSheet(to path: String) {
         let x = CGFloat(i % 8) * cell.width + (cell.width - 96) / 2
         let y = size.height - cell.height - CGFloat(i / 8 + 1) * 110
         context.cgContext.draw(frame, in: CGRect(x: x, y: y, width: 96, height: 96))
+    }
+    if let pokeball {
+        // The strip stands in for the screen, its own right edge the screen's.
+        let screen = NSRect(origin: .zero, size: strip)
+        NSColor(white: 0.8, alpha: 1).setFill()
+        screen.fill()
+        let ball = CGFloat(pokeball.width) * PetView.scale
+        let landing = NSRect(x: 640, y: 30, width: ball, height: ball)
+        let flight = BallThrow(onto: landing, screen: screen, visible: screen)
+        context.cgContext.translateBy(x: 0, y: strip.height) // drawBall expects a flipped view
+        context.cgContext.scaleBy(x: 1, y: -1)
+        for t in stride(from: CGFloat(0), through: 1, by: 0.06) {
+            let (origin, turns) = flight.position(at: t)
+            drawBall(pokeball, in: NSRect(x: origin.x, y: strip.height - origin.y - ball, width: ball, height: ball),
+                     quarterTurns: turns)
+        }
     }
     NSGraphicsContext.restoreGraphicsState()
     try? sheet.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))

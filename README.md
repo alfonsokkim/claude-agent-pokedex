@@ -13,7 +13,7 @@ waiting on you, and which one just finished.
 | Needs you (a permission prompt or a question) | Hops and flashes red, like it's taking hits |
 | Finished | Jumps for joy over "*Pikachu* is done" until you look at it |
 | Idle | Steps in place, then falls asleep with z's drifting up |
-| Untouched for 12 hours | Goes back into its Poke Ball |
+| Untouched for 12 hours | Glows red and shrinks away into its Poke Ball, out of sight. When its session gets busy again, the ball is thrown in from the edge of the screen and it pops back out |
 
 Each session gets its own Pokemon and keeps it. There are 32 to choose from,
 including the starters, Pikachu, Gengar, Snorlax, every Eevee evolution, the
@@ -96,10 +96,12 @@ send a message in a session that was already open to see its pet.
   - **Go to Agent**
   - **Pokemon**: pick a different one from a grid of every sprite. The ones
     other sessions have are greyed out, and picking one swaps the two.
-  - **Return to Poke Ball** / **Let Out**: put a pet away by hand. It comes
-    back out when you click it or its session gets busy.
+  - **Return to Poke Ball**: put a pet away by hand. It's out of sight until
+    its session gets busy, then its ball is thrown back in.
+  - **Let Out**: call back any pet that's away.
   - **Line Up Pets**: a column or a row, in any corner of the screen. Pets are
-    spaced by their real size, so a Snorlax gets more room than a Poke Ball.
+    spaced by their real size, so a Snorlax gets more room than a Pikachu, and
+    ones that are away take no room at all.
 
 ![Picking a Pokemon from the right-click menu](docs/picker.png)
 
